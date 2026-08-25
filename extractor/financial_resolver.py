@@ -165,6 +165,75 @@ def metric_from_question(question: str) -> Optional[str]:
     return None
 
 
+def question_intent(question: str) -> str:
+    text = _norm(question)
+    if any(p in text for p in ("% increase", "percentage increase", "percent increase", "growth rate", "% growth", "grew by")):
+        return "yoy_percent"
+    if any(p in text for p in ("increase", "decrease", "change", "grew", "decline", "growth", "versus", "vs", "year over year", "yoy")):
+        return "yoy_change"
+    return "value"
+
+
+def _pick_candidate(question: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    requested = None
+    m = re.search(r"\b(?:fy\s*)?(20\d{2}(?:[-/–]\d{2})?)\b", question, re.I)
+    if m:
+        requested = m.group(1)
+    for candidate in candidates:
+        values = candidate.get("values") or []
+        periods = candidate.get("periods") or []
+        if len(values) < 2:
+            continue
+        if requested and periods:
+            for idx, period in enumerate(periods):
+                if requested in period and idx < len(values):
+                    return candidate
+        else:
+            return candidate
+    return None
+
+
+def compute_change(question: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    candidate = _pick_candidate(question, candidates)
+    if not candidate:
+        return None
+    values = candidate.get("values") or []
+    periods = candidate.get("periods") or []
+    latest = float(values[0])
+    prior = float(values[1])
+    if prior == 0:
+        return None
+    delta = latest - prior
+    pct = (delta / prior) * 100.0
+    latest_period = periods[0] if len(periods) > 0 else None
+    prior_period = periods[1] if len(periods) > 1 else None
+    intent = question_intent(question)
+    if intent == "yoy_percent":
+        answer: float | str = round(pct, 2)
+        formula = "(latest − prior) / prior × 100"
+    else:
+        answer = round(delta, 2)
+        formula = "latest − prior"
+    return {
+        "metric": candidate.get("metric"),
+        "status": "derived",
+        "answer": answer,
+        "latest_value": latest,
+        "prior_value": prior,
+        "change": round(delta, 2),
+        "percent_change": round(pct, 2),
+        "latest_period": latest_period,
+        "prior_period": prior_period,
+        "period": f"{latest_period} vs {prior_period}" if latest_period and prior_period else None,
+        "formula": formula,
+        "source": candidate,
+        "inputs": [
+            {"name": latest_period or "Latest period", "value": latest, "page": candidate.get("page")},
+            {"name": prior_period or "Prior period", "value": prior, "page": candidate.get("page")},
+        ],
+    }
+
+
 def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     metric = metric_from_question(question)
     candidates = resolve_metric(metric, data) if metric else []
@@ -177,9 +246,14 @@ def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         related["pbt"] = resolve_metric("pbt", data)[:3] or resolve_raw_text("pbt", data)[:3]
         related["finance_costs"] = resolve_metric("finance_costs", data)[:3] or resolve_raw_text("finance_costs", data)[:3]
 
+    computed = None
+    if metric and question_intent(question) != "value":
+        computed = compute_change(question, candidates)
+
     return {
         "question": question,
         "metric": metric,
+        "intent": question_intent(question),
         "document": {
             "source_name": data.get("summary", {}).get("source_name"),
             "metadata": data.get("summary", {}).get("metadata", {}),
@@ -187,6 +261,7 @@ def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "candidates": candidates[:5],
         "raw_evidence": raw_evidence,
         "related": related,
+        "computed": computed,
     }
 
 
