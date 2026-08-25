@@ -109,5 +109,16 @@
     return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
+  document.addEventListener('DOMContentLoaded', () => {
+    const askButton = document.querySelector('#main-nav button[data-view="ask"]');
+    if (!askButton) return;
+    askButton.addEventListener('click', event => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      document.querySelectorAll('#main-nav button').forEach(b => b.classList.toggle('active', b === askButton));
+      renderAsk();
+    }, true);
+  });
+
   window.renderAsk = renderAsk;
 })();
