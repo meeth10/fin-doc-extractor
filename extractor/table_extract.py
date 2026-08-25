@@ -3,12 +3,15 @@
 The extractor intentionally returns *candidates*, not facts. PDF table libraries can
 mistake positioned prose for tables, so every candidate is scored using financial
 shape signals before it is promoted to ``validated``.
+
+Statement assignment is title-first: a financial table's own page title is the
+strongest semantic signal. The page-level locator is only a fallback.
 """
 
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Sequence, Tuple
+from typing import Any, Dict, List, Sequence, Tuple
 
 TEXT_STRATEGY_SETTINGS = {
     "vertical_strategy": "text",
@@ -23,6 +26,32 @@ NUM_RE = re.compile(
 )
 YEAR_RE = re.compile(r"\b(?:FY\s*)?20\d{2}(?:[-/–]\d{2})?\b", re.I)
 LABEL_RE = re.compile(r"[A-Za-z][A-Za-z&().,/\- ]{2,}")
+
+# Title-first statement identification. These are intentionally broad enough to
+# cover common Indian/US filing wording while requiring an explicit statement
+# title on the page. This is the primary signal for downstream assignment.
+STATEMENT_TITLE_PATTERNS = {
+    "balance_sheet": [
+        r"\b(?:consolidated\s+|standalone\s+)?balance\s+sheets?\b",
+        r"\bstatements?\s+of\s+financial\s+position\b",
+    ],
+    "income_statement": [
+        r"\b(?:consolidated\s+|standalone\s+)?profit\s+and\s+loss\s+statements?\b",
+        r"\bstatements?\s+of\s+profit\s+and\s+loss\b",
+        r"\b(?:consolidated\s+|standalone\s+)?income\s+statements?\b",
+        r"\bstatements?\s+of\s+operations\b",
+        r"\bstatements?\s+of\s+comprehensive\s+income\b",
+    ],
+    "cash_flow": [
+        r"\b(?:consolidated\s+|standalone\s+)?cash\s+flow\s+statements?\b",
+        r"\bstatements?\s+of\s+cash\s+flows?\b",
+    ],
+}
+
+_STATEMENT_TITLE_RE = {
+    statement_type: [re.compile(pattern, re.I) for pattern in patterns]
+    for statement_type, patterns in STATEMENT_TITLE_PATTERNS.items()
+}
 
 
 def _clean(raw_table: Sequence[Sequence[Any]]) -> List[List[str]]:
@@ -43,6 +72,33 @@ def _numeric_count(text: str) -> int:
 def _financial_row_like(row: Sequence[str]) -> bool:
     text = " ".join(cell for cell in row if cell).strip()
     return bool(LABEL_RE.search(text)) and _numeric_count(text) >= 1
+
+
+def detect_statement_title(text: str) -> Tuple[str | None, str | None]:
+    """Return (statement_type, matched_title) from explicit page-title text.
+
+    The title is intentionally preferred over generic page scoring. We inspect
+    line-level text first because annual reports usually place the statement name
+    as a dedicated heading immediately above the table.
+    """
+    lines = [" ".join(line.strip().split()) for line in text.splitlines() if line.strip()]
+    candidates = lines[:80]
+    for line in candidates:
+        for statement_type, patterns in _STATEMENT_TITLE_RE.items():
+            for pattern in patterns:
+                match = pattern.search(line)
+                if match:
+                    return statement_type, line
+
+    # OCR/layout can split a heading over multiple lines. Retry against the
+    # normalized page text, but keep the matched phrase rather than the whole page.
+    normalized = " ".join(lines)
+    for statement_type, patterns in _STATEMENT_TITLE_RE.items():
+        for pattern in patterns:
+            match = pattern.search(normalized)
+            if match:
+                return statement_type, match.group(0).strip()
+    return None, None
 
 
 def score_table(table: Sequence[Sequence[str]]) -> Dict[str, Any]:
@@ -116,6 +172,16 @@ def score_table(table: Sequence[Sequence[str]]) -> Dict[str, Any]:
     }
 
 
+def _page_title(fitz_page) -> Tuple[str | None, str | None]:
+    """Read the explicit statement title from the page's digital/OCR text."""
+    if fitz_page is None:
+        return None, None
+    try:
+        return detect_statement_title(fitz_page.get_text("text"))
+    except Exception:
+        return None, None
+
+
 def _pdfplumber_candidates(pdfplumber_page) -> List[Tuple[str, List[List[str]]]]:
     found: List[Tuple[str, List[List[str]]]] = []
     try:
@@ -187,19 +253,36 @@ def _layout_candidates(fitz_page) -> List[List[List[str]]]:
 
 
 def extract_table_candidates(pdfplumber_page, fitz_page=None) -> List[Dict[str, Any]]:
-    """Return ranked table candidates from multiple extraction strategies."""
+    """Return ranked table candidates with explicit page-title semantics."""
     candidates: List[Dict[str, Any]] = []
+    statement_type, statement_title = _page_title(fitz_page)
+
     for source, table in _pdfplumber_candidates(pdfplumber_page):
         if table:
             metrics = score_table(table)
-            candidates.append({"source": source, "table": table, **metrics})
+            candidates.append({
+                "source": source,
+                "table": table,
+                "statement_type_from_title": statement_type,
+                "table_title": statement_title,
+                "title_source": "page_title" if statement_type else None,
+                **metrics,
+            })
 
     if fitz_page is not None:
         for table in _layout_candidates(fitz_page):
             metrics = score_table(table)
-            candidates.append({"source": "pymupdf_layout", "table": table, **metrics})
+            candidates.append({
+                "source": "pymupdf_layout",
+                "table": table,
+                "statement_type_from_title": statement_type,
+                "table_title": statement_title,
+                "title_source": "page_title" if statement_type else None,
+                **metrics,
+            })
 
-    # De-duplicate exact tables, keeping the strongest source/score.
+    # De-duplicate exact tables, keeping the strongest source/score. Title
+    # semantics travel with the selected candidate.
     unique: Dict[str, Dict[str, Any]] = {}
     for candidate in candidates:
         key = repr(candidate["table"])
