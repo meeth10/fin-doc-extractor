@@ -1,12 +1,4 @@
-"""Financial PDF evidence extraction pipeline.
-
-Design principle: preserve evidence first. The pipeline emits three useful layers:
-1) normalized page text and document metadata,
-2) ranked/validated financial table candidates,
-3) rendered page images for visual/agent review.
-
-No AI is required here; agents can consume these artifacts later.
-"""
+"""Financial PDF evidence extraction pipeline."""
 
 from __future__ import annotations
 
@@ -26,6 +18,7 @@ from .metadata import detect_metadata
 
 RENDER_DPI = 120
 ProgressCallback = Optional[Callable[[int, str], None]]
+TARGET_STATEMENTS = ("balance_sheet", "income_statement", "cash_flow")
 
 
 def _progress(callback: ProgressCallback, percent: int, message: str) -> None:
@@ -79,6 +72,42 @@ def _render_pages(
         pct = 80 + int((i / total) * 15)
         _progress(progress_callback, pct, f"Rendering page images ({i}/{total})")
     return rendered
+
+
+def _attach_statement_types(table_records: List[Dict], page_scores: List) -> None:
+    """Attach a conservative statement label using only confident page scores.
+
+    A table is never forced into Balance Sheet / Income Statement / Cash Flow
+    solely from the broad section range. Ambiguous pages remain unassigned so
+    downstream agents can inspect the evidence rather than inherit a guess.
+    """
+    score_by_page = {s.page_number: s for s in page_scores}
+    for table in table_records:
+        score = score_by_page.get(table["page_number"])
+        statement_type = None
+        statement_confidence = 0.0
+        if score and score.status == "confident" and score.best_category in TARGET_STATEMENTS:
+            statement_type = score.best_category
+            statement_confidence = score.confidence
+        table["statement_type"] = statement_type
+        table["statement_confidence"] = statement_confidence
+
+
+def _isolated_statement_outputs(validated: List[Dict]) -> Dict[str, Dict]:
+    outputs: Dict[str, Dict] = {}
+    for statement_type in TARGET_STATEMENTS:
+        tables = [
+            t for t in validated
+            if t.get("statement_type") == statement_type
+        ]
+        tables.sort(key=lambda t: (t["page_number"], -t["score"]))
+        outputs[statement_type] = {
+            "statement_type": statement_type,
+            "table_count": len(tables),
+            "pages": sorted({t["page_number_human"] for t in tables}),
+            "tables": tables,
+        }
+    return outputs
 
 
 def extract(
@@ -145,10 +174,15 @@ def extract(
                             **candidate,
                         })
 
+    _attach_statement_types(table_records, page_scores)
     validated = [t for t in table_records if t["validated"]]
+    isolated_statements = _isolated_statement_outputs(validated)
+
     best_by_page: Dict[int, Dict] = {}
     for t in validated:
-        best_by_page.setdefault(t["page_number"], t)
+        current = best_by_page.get(t["page_number"])
+        if current is None or t["score"] > current["score"]:
+            best_by_page[t["page_number"]] = t
 
     output_pages = []
     for r in page_records:
@@ -167,7 +201,7 @@ def extract(
         })
 
     result = {
-        "schema_version": "2.0",
+        "schema_version": "2.1",
         "source_file": pdf_path,
         "total_pages": total_pages,
         "document_metadata": doc_metadata.as_dict(),
@@ -175,6 +209,7 @@ def extract(
         "ambiguous_pages": [p + 1 for p in ambiguous_pages],
         "flagged_page_count": len(flagged_pages),
         "pages": output_pages,
+        "statement_tables": isolated_statements,
         "table_summary": {
             "candidate_count": len(table_records),
             "validated_count": len(validated),
@@ -229,15 +264,33 @@ def extract(
         with tables_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "schema_version": "2.0",
+                    "schema_version": "2.1",
                     "source_file": pdf_path,
                     "tables": table_records,
+                    "statement_tables": isolated_statements,
                     "best_document_table": result["table_summary"]["best_document_table"],
                 },
                 f,
                 indent=2,
                 ensure_ascii=False,
             )
+
+        statement_files = {}
+        for statement_type, payload in isolated_statements.items():
+            path = out / f"{statement_type}.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "2.1",
+                        "source_file": pdf_path,
+                        **payload,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            statement_files[statement_type] = str(path)
 
         if render_images:
             image_dir = out / "pages"
@@ -247,7 +300,7 @@ def extract(
         with visuals_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "schema_version": "2.0",
+                    "schema_version": "2.1",
                     "source_file": pdf_path,
                     "render_dpi": RENDER_DPI,
                     "pages": rendered,
@@ -261,6 +314,7 @@ def extract(
             "tables_json": str(tables_path),
             "visuals_json": str(visuals_path),
             "page_image_dir": str(out / "pages") if render_images else None,
+            "statement_files": statement_files,
         }
 
     _progress(progress_callback, 100, "Extraction complete")
