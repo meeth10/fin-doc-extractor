@@ -19,7 +19,12 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         ],
         "stream": False,
         "format": "json",
-        "options": {"temperature": 0},
+        "think": False,
+        "options": {
+            "temperature": 0,
+            "num_ctx": 4096,
+            "num_predict": 800,
+        },
     }
     request = urllib.request.Request(
         f"{OLLAMA_BASE_URL}/api/chat",
@@ -28,8 +33,17 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=180) as response:
+        with urllib.request.urlopen(request, timeout=120) as response:
             body = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:500]
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Ollama returned HTTP {exc.code} at {OLLAMA_BASE_URL}: {detail or exc.reason}"
+        ) from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(
             f"Ollama is unavailable at {OLLAMA_BASE_URL}. Start it with `ollama serve`."
