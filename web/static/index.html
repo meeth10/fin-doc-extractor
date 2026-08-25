@@ -7,19 +7,56 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header><div><strong>FIN DOC EXTRACTOR</strong><span>Evidence inspection lab</span></div><label class="upload"><input id="file" type="file" accept="application/pdf" /><span>Upload PDF</span></label></header>
-  <main id="empty" class="empty"><h1>Throw a financial PDF at it.</h1><p>Inspect the original page, extracted text and ranked table candidates side by side.</p></main>
+  <header class="topbar">
+    <div class="brand">
+      <strong>FIN DOC EXTRACTOR</strong>
+      <span>Financial evidence lab</span>
+    </div>
+    <label class="upload-button">
+      <input id="file" type="file" accept="application/pdf" />
+      <span>Upload PDF</span>
+    </label>
+  </header>
+
+  <main id="empty" class="empty-state">
+    <div class="eyebrow">DOCUMENT INTELLIGENCE</div>
+    <h1>From PDF to analyst-ready evidence.</h1>
+    <p>Extract the statement pages, preserve the source evidence, and inspect Balance Sheet, Income Statement and Cash Flow separately.</p>
+    <label class="empty-upload upload-button">
+      <input id="file-empty" type="file" accept="application/pdf" />
+      <span>Select a financial PDF</span>
+    </label>
+  </main>
+
   <main id="app" hidden>
-    <aside>
-      <section id="summary"></section>
-      <h3>Pages</h3><div id="pages" class="pages"></div>
+    <aside class="sidebar">
+      <section id="summary" class="summary"></section>
+      <div class="sidebar-heading"><span>Pages</span><span id="page-count"></span></div>
+      <div id="pages" class="pages"></div>
     </aside>
+
     <section class="workspace">
-      <div class="tabs"><button data-tab="evidence" class="active">Evidence</button><button data-tab="tables">Tables</button><button data-tab="text">Raw text</button></div>
-      <div id="content"></div>
+      <nav id="main-nav" class="main-nav">
+        <button data-view="overview" class="active">Overview</button>
+        <button data-view="balance_sheet">Balance Sheet</button>
+        <button data-view="income_statement">Income Statement</button>
+        <button data-view="cash_flow">Cash Flow</button>
+        <button data-view="tables">All Tables</button>
+        <button data-view="text">Raw Text</button>
+      </nav>
+      <div id="content" class="content"></div>
     </section>
   </main>
-  <div id="loading" hidden>Extracting document… this can take a moment.</div>
+
+  <div id="loading" hidden>
+    <div class="loading-card">
+      <div class="spinner"></div>
+      <div id="loading-title">Preparing document</div>
+      <div id="loading-detail">Uploading PDF…</div>
+      <div class="progress-track"><div id="progress-bar"></div></div>
+    </div>
+  </div>
+
   <script src="/static/app.js"></script>
 </body>
 </html>
