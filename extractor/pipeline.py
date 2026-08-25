@@ -75,37 +75,50 @@ def _render_pages(
 
 
 def _attach_statement_types(table_records: List[Dict], page_scores: List) -> None:
-    """Attach a conservative statement label using only confident page scores.
+    """Assign statement type title-first, then fall back to page classification.
 
-    A table is never forced into Balance Sheet / Income Statement / Cash Flow
-    solely from the broad section range. Ambiguous pages remain unassigned so
-    downstream agents can inspect the evidence rather than inherit a guess.
+    Explicit financial-statement titles are the strongest semantic evidence:
+    "Balance Sheet", "Statement of Profit and Loss", "Cash Flow Statement", etc.
+    Only when no explicit title was found do we use a confident page-level score.
     """
     score_by_page = {s.page_number: s for s in page_scores}
     for table in table_records:
-        score = score_by_page.get(table["page_number"])
-        statement_type = None
-        statement_confidence = 0.0
-        if score and score.status == "confident" and score.best_category in TARGET_STATEMENTS:
-            statement_type = score.best_category
-            statement_confidence = score.confidence
-        table["statement_type"] = statement_type
+        statement_type = table.get("statement_type_from_title")
+        statement_confidence = 1.0 if statement_type in TARGET_STATEMENTS else 0.0
+        assignment = "title" if statement_type in TARGET_STATEMENTS else None
+
+        if statement_type not in TARGET_STATEMENTS:
+            score = score_by_page.get(table["page_number"])
+            if score and score.status == "confident" and score.best_category in TARGET_STATEMENTS:
+                statement_type = score.best_category
+                statement_confidence = score.confidence
+                assignment = "page_classifier"
+
+        table["statement_type"] = statement_type if statement_type in TARGET_STATEMENTS else None
         table["statement_confidence"] = statement_confidence
+        table["statement_assignment"] = assignment
 
 
-def _isolated_statement_outputs(validated: List[Dict]) -> Dict[str, Dict]:
+def _isolated_statement_outputs(tables: List[Dict]) -> Dict[str, Dict]:
     outputs: Dict[str, Dict] = {}
     for statement_type in TARGET_STATEMENTS:
-        tables = [
-            t for t in validated
+        statement_tables = [
+            t for t in tables
             if t.get("statement_type") == statement_type
         ]
-        tables.sort(key=lambda t: (t["page_number"], -t["score"]))
+        statement_tables.sort(
+            key=lambda t: (
+                0 if t.get("statement_assignment") == "title" else 1,
+                t["page_number"],
+                -t["score"],
+            )
+        )
         outputs[statement_type] = {
             "statement_type": statement_type,
-            "table_count": len(tables),
-            "pages": sorted({t["page_number_human"] for t in tables}),
-            "tables": tables,
+            "table_count": len(statement_tables),
+            "pages": sorted({t["page_number_human"] for t in statement_tables}),
+            "status": "validated" if any(t["validated"] for t in statement_tables) else ("provisional" if statement_tables else "empty"),
+            "tables": statement_tables,
         }
     return outputs
 
@@ -175,8 +188,20 @@ def extract(
                         })
 
     _attach_statement_types(table_records, page_scores)
+
+    # Keep all title-assigned tables for statement isolation. A title is a
+    # semantic assignment even when table-shape validation is imperfect; such
+    # tables are marked provisional rather than discarded.
+    statement_candidates = [
+        t for t in table_records
+        if t.get("statement_type") in TARGET_STATEMENTS
+    ]
+    for t in statement_candidates:
+        if t.get("statement_assignment") == "title" and not t.get("validated"):
+            t["statement_assignment"] = "provisional"
+
     validated = [t for t in table_records if t["validated"]]
-    isolated_statements = _isolated_statement_outputs(validated)
+    isolated_statements = _isolated_statement_outputs(statement_candidates)
 
     best_by_page: Dict[int, Dict] = {}
     for t in validated:
@@ -201,7 +226,7 @@ def extract(
         })
 
     result = {
-        "schema_version": "2.1",
+        "schema_version": "2.2",
         "source_file": pdf_path,
         "total_pages": total_pages,
         "document_metadata": doc_metadata.as_dict(),
@@ -264,7 +289,7 @@ def extract(
         with tables_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "schema_version": "2.1",
+                    "schema_version": "2.2",
                     "source_file": pdf_path,
                     "tables": table_records,
                     "statement_tables": isolated_statements,
@@ -281,7 +306,7 @@ def extract(
             path.write_text(
                 json.dumps(
                     {
-                        "schema_version": "2.1",
+                        "schema_version": "2.2",
                         "source_file": pdf_path,
                         **payload,
                     },
@@ -300,7 +325,7 @@ def extract(
         with visuals_path.open("w", encoding="utf-8") as f:
             json.dump(
                 {
-                    "schema_version": "2.1",
+                    "schema_version": "2.2",
                     "source_file": pdf_path,
                     "render_dpi": RENDER_DPI,
                     "pages": rendered,
