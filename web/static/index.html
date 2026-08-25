@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Fin Doc Extractor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header><div><strong>FIN DOC EXTRACTOR</strong><span>Evidence inspection lab</span></div><label class="upload"><input id="file" type="file" accept="application/pdf" /><span>Upload PDF</span></label></header>
+  <main id="empty" class="empty"><h1>Throw a financial PDF at it.</h1><p>Inspect the original page, extracted text and ranked table candidates side by side.</p></main>
+  <main id="app" hidden>
+    <aside>
+      <section id="summary"></section>
+      <h3>Pages</h3><div id="pages" class="pages"></div>
+    </aside>
+    <section class="workspace">
+      <div class="tabs"><button data-tab="evidence" class="active">Evidence</button><button data-tab="tables">Tables</button><button data-tab="text">Raw text</button></div>
+      <div id="content"></div>
+    </section>
+  </main>
+  <div id="loading" hidden>Extracting document… this can take a moment.</div>
+  <script src="/static/app.js"></script>
+</body>
+</html>
