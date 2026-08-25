@@ -35,42 +35,19 @@ def _write_status(run_dir: Path, **payload) -> None:
 def _run_extraction(run_id: str, source_name: str) -> None:
     run_dir = RUNS / run_id
     pdf_path = run_dir / "source.pdf"
-
-    def progress(percent: int, message: str) -> None:
-        _write_status(run_dir, status="running", progress=percent, message=message, source_name=source_name)
-
     try:
-        progress(1, "Starting extraction")
-        result = extract(
-            str(pdf_path),
-            out_dir=str(run_dir),
-            debug=True,
-            render_images=True,
-            progress_callback=progress,
-        )
+        _write_status(run_dir, status="running", progress=5, message="Reading PDF and extracting evidence", source_name=source_name)
+        result = extract(str(pdf_path), out_dir=str(run_dir), debug=True, render_images=True)
+        _write_status(run_dir, status="running", progress=90, message="Preparing results for inspection", source_name=source_name)
 
         document = json.loads(Path(result["artifacts"]["document_json"]).read_text(encoding="utf-8"))
         tables = json.loads(Path(result["artifacts"]["tables_json"]).read_text(encoding="utf-8"))
         visuals = json.loads(Path(result["artifacts"]["visuals_json"]).read_text(encoding="utf-8"))
-
         for page in visuals.get("pages", []):
             filename = Path(page["path"]).name
             page["url"] = f"/runs/{run_id}/pages/{filename}"
 
-        payload = {
-            "run_id": run_id,
-            "summary": {
-                "source_name": source_name,
-                "total_pages": result["total_pages"],
-                "metadata": result["document_metadata"],
-                "sections": result["sections_found"],
-                "table_summary": result["table_summary"],
-                "elapsed_seconds": result["elapsed_seconds"],
-            },
-            "document": document,
-            "tables": tables,
-            "visuals": visuals,
-        }
+        payload = {"run_id": run_id, "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "elapsed_seconds": result["elapsed_seconds"]}, "document": document, "tables": tables, "visuals": visuals}
         (run_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
         _write_status(run_dir, status="complete", progress=100, message="Extraction complete", source_name=source_name)
     except Exception as exc:
@@ -86,15 +63,11 @@ def home():
 async def extract_pdf(file: UploadFile = File(...)):
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Upload a PDF file.")
-
     run_id = uuid.uuid4().hex[:12]
     run_dir = RUNS / run_id
     run_dir.mkdir(parents=True)
-    pdf_path = run_dir / "source.pdf"
-
-    with pdf_path.open("wb") as out:
+    with (run_dir / "source.pdf").open("wb") as out:
         shutil.copyfileobj(file.file, out)
-
     _write_status(run_dir, status="queued", progress=0, message="Queued", source_name=file.filename)
     executor.submit(_run_extraction, run_id, file.filename)
     return {"run_id": run_id, "status": "queued"}
