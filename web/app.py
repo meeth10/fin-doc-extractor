@@ -16,11 +16,18 @@ ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "runs"
 STATIC = Path(__file__).resolve().parent / "static"
 RUNS.mkdir(exist_ok=True)
+executor = ThreadPoolExecutor(max_workers=2)
+
+STATEMENT_TYPES = ("balance_sheet", "income_statement", "cash_flow")
+STATEMENT_LABELS = {
+    "balance_sheet": "Balance Sheet",
+    "income_statement": "Income Statement",
+    "cash_flow": "Cash Flow",
+}
 
 app = FastAPI(title="Fin Doc Extractor")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 app.mount("/runs", StaticFiles(directory=RUNS), name="runs")
-executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _status_path(run_dir: Path) -> Path:
@@ -32,22 +39,114 @@ def _write_status(run_dir: Path, **payload) -> None:
     _status_path(run_dir).write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
+def _page_scores(result: dict) -> dict[int, dict]:
+    return {
+        int(item["page_number_human"]) - 1: item
+        for item in result.get("_debug", {}).get("page_scores", [])
+    }
+
+
+def _table_statement_type(table: dict, page_scores: dict[int, dict]) -> tuple[str | None, str]:
+    """Assign a table to a statement without requiring a perfect page score.
+
+    confident locator pages -> validated assignment
+    ambiguous locator pages with a strong table -> provisional assignment
+    everything else -> unassigned
+    """
+    score = float(table.get("score", 0) or 0)
+    if not table.get("validated"):
+        return None, "rejected"
+
+    page = int(table.get("page_number", -1))
+    ps = page_scores.get(page)
+    if not ps:
+        return None, "unassigned"
+
+    category = ps.get("best_category")
+    status = ps.get("status")
+    if category not in STATEMENT_TYPES:
+        return None, "unassigned"
+
+    # Strong tables can rescue an ambiguous locator page. We keep that
+    # distinction visible so downstream agents know the evidence quality.
+    if status == "confident":
+        return category, "validated"
+    if status == "ambiguous" and score >= 0.85:
+        return category, "provisional"
+    return None, "unassigned"
+
+
+def _build_statement_tables(result: dict, tables: dict) -> dict:
+    page_scores = _page_scores(result)
+    grouped = {
+        key: {"label": STATEMENT_LABELS[key], "tables": [], "pages": [], "status": "empty"}
+        for key in STATEMENT_TYPES
+    }
+
+    for table in tables.get("tables", []):
+        statement_type, assignment = _table_statement_type(table, page_scores)
+        enriched = dict(table)
+        enriched["statement_type"] = statement_type
+        enriched["statement_assignment"] = assignment
+        enriched["statement_confidence"] = (
+            page_scores.get(int(table.get("page_number", -1)), {}).get("confidence")
+            if statement_type else None
+        )
+        if statement_type:
+            grouped[statement_type]["tables"].append(enriched)
+
+    for key, bucket in grouped.items():
+        bucket["tables"].sort(
+            key=lambda t: (
+                t.get("statement_assignment") != "validated",
+                -(float(t.get("score", 0) or 0)),
+                int(t.get("page_number", 10**9)),
+            )
+        )
+        bucket["pages"] = sorted({int(t["page_number_human"]) for t in bucket["tables"]})
+        if any(t["statement_assignment"] == "validated" for t in bucket["tables"]):
+            bucket["status"] = "validated"
+        elif bucket["tables"]:
+            bucket["status"] = "provisional"
+
+    return grouped
+
+
 def _run_extraction(run_id: str, source_name: str) -> None:
     run_dir = RUNS / run_id
     pdf_path = run_dir / "source.pdf"
     try:
         _write_status(run_dir, status="running", progress=5, message="Reading PDF and extracting evidence", source_name=source_name)
         result = extract(str(pdf_path), out_dir=str(run_dir), debug=True, render_images=True)
-        _write_status(run_dir, status="running", progress=90, message="Preparing results for inspection", source_name=source_name)
+        _write_status(run_dir, status="running", progress=90, message="Preparing statement outputs", source_name=source_name)
 
         document = json.loads(Path(result["artifacts"]["document_json"]).read_text(encoding="utf-8"))
         tables = json.loads(Path(result["artifacts"]["tables_json"]).read_text(encoding="utf-8"))
         visuals = json.loads(Path(result["artifacts"]["visuals_json"]).read_text(encoding="utf-8"))
+
         for page in visuals.get("pages", []):
             filename = Path(page["path"]).name
             page["url"] = f"/runs/{run_id}/pages/{filename}"
 
-        payload = {"run_id": run_id, "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "elapsed_seconds": result["elapsed_seconds"]}, "document": document, "tables": tables, "visuals": visuals}
+        statement_tables = _build_statement_tables(result, tables)
+        statement_counts = {key: len(bucket["tables"]) for key, bucket in statement_tables.items()}
+
+        payload = {
+            "run_id": run_id,
+            "summary": {
+                "source_name": source_name,
+                "total_pages": result["total_pages"],
+                "metadata": result["document_metadata"],
+                "sections": result["sections_found"],
+                "table_summary": result["table_summary"],
+                "statement_counts": statement_counts,
+                "elapsed_seconds": result["elapsed_seconds"],
+            },
+            "statement_tables": statement_tables,
+            "document": document,
+            "tables": tables,
+            "visuals": visuals,
+        }
         (run_dir / "result.json").write_text(json.dumps(payload), encoding="utf-8")
         _write_status(run_dir, status="complete", progress=100, message="Extraction complete", source_name=source_name)
     except Exception as exc:
