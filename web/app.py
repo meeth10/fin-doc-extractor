@@ -9,8 +9,10 @@ from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
 from extractor.pipeline import extract
+from agent.financial_agent import answer_question
 
 ROOT = Path(__file__).resolve().parent.parent
 RUNS = ROOT / "runs"
@@ -30,6 +32,11 @@ app.mount("/static", StaticFiles(directory=STATIC), name="static")
 app.mount("/runs", StaticFiles(directory=RUNS), name="runs")
 
 
+class AskRequest(BaseModel):
+    question: str
+    run_id: str | None = None
+
+
 def _status_path(run_dir: Path) -> Path:
     return run_dir / "status.json"
 
@@ -47,23 +54,19 @@ def _page_scores(result: dict) -> dict[int, dict]:
 
 
 def _table_statement_type(table: dict, page_scores: dict[int, dict]) -> tuple[str | None, str]:
-    score = float(table.get("score", 0) or 0)
     if not table.get("validated"):
         return None, "rejected"
-
     page = int(table.get("page_number", -1))
     ps = page_scores.get(page)
     if not ps:
         return None, "unassigned"
-
     category = ps.get("best_category")
     status = ps.get("status")
     if category not in STATEMENT_TYPES:
         return None, "unassigned"
-
     if status == "confident":
         return category, "validated"
-    if status == "ambiguous" and score >= 0.85:
+    if status == "ambiguous" and float(table.get("score", 0) or 0) >= 0.85:
         return category, "provisional"
     return None, "unassigned"
 
@@ -74,33 +77,21 @@ def _build_statement_tables(result: dict, tables: dict) -> dict:
         key: {"label": STATEMENT_LABELS[key], "tables": [], "pages": [], "status": "empty"}
         for key in STATEMENT_TYPES
     }
-
     for table in tables.get("tables", []):
         statement_type, assignment = _table_statement_type(table, page_scores)
         enriched = dict(table)
         enriched["statement_type"] = statement_type
         enriched["statement_assignment"] = assignment
-        enriched["statement_confidence"] = (
-            page_scores.get(int(table.get("page_number", -1)), {}).get("confidence")
-            if statement_type else None
-        )
+        enriched["statement_confidence"] = page_scores.get(int(table.get("page_number", -1)), {}).get("confidence") if statement_type else None
         if statement_type:
             grouped[statement_type]["tables"].append(enriched)
-
     for key, bucket in grouped.items():
-        bucket["tables"].sort(
-            key=lambda t: (
-                t.get("statement_assignment") != "validated",
-                -(float(t.get("score", 0) or 0)),
-                int(t.get("page_number", 10**9)),
-            )
-        )
+        bucket["tables"].sort(key=lambda t: (t.get("statement_assignment") != "validated", -(float(t.get("score", 0) or 0)), int(t.get("page_number", 10**9))))
         bucket["pages"] = sorted({int(t["page_number_human"]) for t in bucket["tables"]})
         if any(t["statement_assignment"] == "validated" for t in bucket["tables"]):
             bucket["status"] = "validated"
         elif bucket["tables"]:
             bucket["status"] = "provisional"
-
     return grouped
 
 
@@ -115,39 +106,20 @@ def _run_extraction(run_id: str, source_name: str) -> None:
         document = json.loads(Path(result["artifacts"]["document_json"]).read_text(encoding="utf-8"))
         tables = json.loads(Path(result["artifacts"]["tables_json"]).read_text(encoding="utf-8"))
         visuals = json.loads(Path(result["artifacts"]["visuals_json"]).read_text(encoding="utf-8"))
-
         for page in visuals.get("pages", []):
             filename = Path(page["path"]).name
             page["url"] = f"/runs/{run_id}/pages/{filename}"
 
-        statement_tables = _build_statement_tables(result, tables)
-        statement_counts = {key: len(bucket["tables"]) for key, bucket in statement_tables.items()}
+        statement_tables = result.get("statement_tables") or _build_statement_tables(result, tables)
+        statement_counts = {key: len(bucket.get("tables", [])) for key, bucket in statement_tables.items()}
 
-        # Persist the three core streams independently. These are intentionally
-        # lightweight agent-facing views over the same source evidence.
         for key in STATEMENT_TYPES:
-            payload = {
-                "schema_version": "1.0",
-                "statement_type": key,
-                "statement_label": STATEMENT_LABELS[key],
-                "source_file": source_name,
-                "status": statement_tables[key]["status"],
-                "pages": statement_tables[key]["pages"],
-                "tables": statement_tables[key]["tables"],
-            }
+            payload = {"schema_version": "1.0", "statement_type": key, "statement_label": STATEMENT_LABELS[key], "source_file": source_name, "status": statement_tables[key]["status"], "pages": statement_tables[key]["pages"], "tables": statement_tables[key]["tables"]}
             (run_dir / f"{key}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
         payload = {
             "run_id": run_id,
-            "summary": {
-                "source_name": source_name,
-                "total_pages": result["total_pages"],
-                "metadata": result["document_metadata"],
-                "sections": result["sections_found"],
-                "table_summary": result["table_summary"],
-                "statement_counts": statement_counts,
-                "elapsed_seconds": result["elapsed_seconds"],
-            },
+            "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "statement_counts": statement_counts, "elapsed_seconds": result["elapsed_seconds"]},
             "statement_tables": statement_tables,
             "document": document,
             "tables": tables,
@@ -176,6 +148,28 @@ async def extract_pdf(file: UploadFile = File(...)):
     _write_status(run_dir, status="queued", progress=0, message="Queued", source_name=file.filename)
     executor.submit(_run_extraction, run_id, file.filename)
     return {"run_id": run_id, "status": "queued"}
+
+
+@app.post("/api/ask")
+def ask_financials(request: AskRequest):
+    question = request.question.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+
+    run_dir = RUNS / request.run_id if request.run_id else None
+    if run_dir is None or not (run_dir / "result.json").exists():
+        candidates = [p for p in RUNS.iterdir() if p.is_dir() and (p / "result.json").exists()]
+        if not candidates:
+            raise HTTPException(status_code=404, detail="No completed document is available. Upload a PDF first.")
+        run_dir = max(candidates, key=lambda p: (p / "result.json").stat().st_mtime)
+
+    try:
+        data = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
+        result = answer_question(question, data)
+        result["run_id"] = run_dir.name
+        return result
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/runs/{run_id}/status")
