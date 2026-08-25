@@ -7,7 +7,9 @@ import urllib.request
 from typing import Any, Dict
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:14b")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
+OLLAMA_CONTEXT = int(os.getenv("OLLAMA_CONTEXT", "16384"))
+OLLAMA_MAX_OUTPUT = int(os.getenv("OLLAMA_MAX_OUTPUT", "512"))
 
 
 def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any]:
@@ -20,10 +22,11 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         "stream": False,
         "format": "json",
         "think": False,
+        "keep_alive": "10m",
         "options": {
             "temperature": 0,
-            "num_ctx": 4096,
-            "num_predict": 800,
+            "num_ctx": OLLAMA_CONTEXT,
+            "num_predict": OLLAMA_MAX_OUTPUT,
         },
     }
     request = urllib.request.Request(
@@ -33,7 +36,7 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=90) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
