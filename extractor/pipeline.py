@@ -92,8 +92,6 @@ def _looks_title_like(normalized: str) -> bool:
     words = normalized.split()
     if len(words) > 24:
         return False
-    # A heading is usually concise. These common narrative verbs/phrases are
-    # strong evidence that the line is prose rather than a statement title.
     narrative_markers = (
         "the amount", "the company", "is disclosed", "is recognised", "are disclosed",
         "recognised in", "refer to", "see note", "as per note", "during the year",
@@ -205,10 +203,9 @@ def _attach_statement_types(page_records: List[Dict], table_records: List[Dict])
                 table["statement_assignment"] = "provisional"
                 table["statement_confidence"] = 0.75
 
-    # Use the statement page classifier only when no explicit title assignment
-    # exists. This preserves evidence but prevents buried references from being
-    # promoted to primary statement tables.
-    score_by_page = {s.page_number: s for s in page_records}
+    # There is intentionally no page-classifier fallback here. The isolated
+    # statement layer must stay high precision; generic page scores remain
+    # available in the debug/page evidence layer instead.
     return selected
 
 
@@ -272,7 +269,7 @@ def extract(
                     if candidate["score"] >= 0.45:
                         table_records.append({"page_number": pn, "page_number_human": pn + 1, "rank": rank + 1, "scope": "global_fallback", **candidate})
 
-    selected = _attach_statement_types(page_records, table_records)
+    _attach_statement_types(page_records, table_records)
     validated = [t for t in table_records if t["validated"]]
     statement_candidates = [t for t in table_records if t.get("statement_type") in TARGET_STATEMENTS]
     isolated_statements = _isolated_statement_outputs(statement_candidates)
@@ -301,14 +298,32 @@ def extract(
         "flagged_page_count": len(flagged_pages),
         "pages": output_pages,
         "statement_tables": isolated_statements,
-        "table_summary": {"candidate_count": len(table_records), "validated_count": len(validated), "pages_with_validated_tables": len(best_by_page), "best_document_table": max(validated, key=lambda t: t["score"], default=None)},
+        "table_summary": {
+            "candidate_count": len(table_records),
+            "validated_count": len(validated),
+            "pages_with_validated_tables": len(best_by_page),
+            "best_document_table": max(validated, key=lambda t: t["score"], default=None),
+        },
         "elapsed_seconds": round(time.time() - t0, 2),
     }
 
     if debug:
         result["_debug"] = {
-            "page_scores": [{"page_number_human": s.page_number + 1, "status": s.status, "best_category": s.best_category, "confidence": s.confidence, "category_scores": s.category_scores, "signals": s.signals} for s in page_scores if s.status != "none"],
-            "table_candidates": [{k: v for k, v in t.items() if k not in {"table"}} for t in table_records],
+            "page_scores": [
+                {
+                    "page_number_human": s.page_number + 1,
+                    "status": s.status,
+                    "best_category": s.best_category,
+                    "confidence": s.confidence,
+                    "category_scores": s.category_scores,
+                    "signals": s.signals,
+                }
+                for s in page_scores if s.status != "none"
+            ],
+            "table_candidates": [
+                {k: v for k, v in t.items() if k not in {"table"}}
+                for t in table_records
+            ],
         }
 
     if out_dir:
@@ -317,25 +332,78 @@ def extract(
         document_path = out / (Path(pdf_path).stem + "_document.json")
         tables_path = out / (Path(pdf_path).stem + "_tables.json")
         visuals_path = out / (Path(pdf_path).stem + "_visuals.json")
+
         text_payload = dict(result)
         text_payload.pop("_debug", None)
         text_payload.pop("table_summary", None)
         text_payload.pop("pages", None)
-        text_payload["pages"] = [{"page_number": r["page_number"], "page_number_human": r["page_number"] + 1, "extraction_method": r["method"], "raw_text": r["text"]} for r in page_records]
-        document_path.write_text(json.dumps(text_payload, indent=2, ensure_ascii=False), encoding="utf-8")
-        tables_path.write_text(json.dumps({"schema_version": "2.2", "source_file": pdf_path, "tables": table_records, "statement_tables": isolated_statements, "best_document_table": result["table_summary"]["best_document_table"]}, indent=2, ensure_ascii=False), encoding="utf-8")
+        text_payload["pages"] = [
+            {
+                "page_number": r["page_number"],
+                "page_number_human": r["page_number"] + 1,
+                "extraction_method": r["method"],
+                "raw_text": r["text"],
+            }
+            for r in page_records
+        ]
+        with document_path.open("w", encoding="utf-8") as f:
+            json.dump(text_payload, f, indent=2, ensure_ascii=False)
+
+        with tables_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "schema_version": "2.2",
+                    "source_file": pdf_path,
+                    "tables": table_records,
+                    "statement_tables": isolated_statements,
+                    "best_document_table": result["table_summary"]["best_document_table"],
+                },
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+
         statement_files = {}
         for statement_type, payload in isolated_statements.items():
             path = out / f"{statement_type}.json"
-            path.write_text(json.dumps({"schema_version": "2.2", "source_file": pdf_path, **payload}, indent=2, ensure_ascii=False), encoding="utf-8")
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "2.2",
+                        "source_file": pdf_path,
+                        **payload,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             statement_files[statement_type] = str(path)
+
         if render_images:
             image_dir = out / "pages"
             rendered = _render_pages(doc, set(range(total_pages)), image_dir, progress_callback)
         else:
             rendered = []
-        visuals_path.write_text(json.dumps({"schema_version": "2.2", "source_file": pdf_path, "render_dpi": RENDER_DPI, "pages": rendered}, indent=2), encoding="utf-8")
-        result["artifacts"] = {"document_json": str(document_path), "tables_json": str(tables_path), "visuals_json": str(visuals_path), "page_image_dir": str(out / "pages") if render_images else None, "statement_files": statement_files}
+        with visuals_path.open("w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "schema_version": "2.2",
+                    "source_file": pdf_path,
+                    "render_dpi": RENDER_DPI,
+                    "pages": rendered,
+                },
+                f,
+                indent=2,
+            )
+
+        result["artifacts"] = {
+            "document_json": str(document_path),
+            "tables_json": str(tables_path),
+            "visuals_json": str(visuals_path),
+            "page_image_dir": str(out / "pages") if render_images else None,
+            "statement_files": statement_files,
+        }
 
     _progress(progress_callback, 100, "Extraction complete")
     doc.close()
