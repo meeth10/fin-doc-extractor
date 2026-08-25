@@ -47,12 +47,6 @@ def _page_scores(result: dict) -> dict[int, dict]:
 
 
 def _table_statement_type(table: dict, page_scores: dict[int, dict]) -> tuple[str | None, str]:
-    """Assign a table to a statement without requiring a perfect page score.
-
-    confident locator pages -> validated assignment
-    ambiguous locator pages with a strong table -> provisional assignment
-    everything else -> unassigned
-    """
     score = float(table.get("score", 0) or 0)
     if not table.get("validated"):
         return None, "rejected"
@@ -67,8 +61,6 @@ def _table_statement_type(table: dict, page_scores: dict[int, dict]) -> tuple[st
     if category not in STATEMENT_TYPES:
         return None, "unassigned"
 
-    # Strong tables can rescue an ambiguous locator page. We keep that
-    # distinction visible so downstream agents know the evidence quality.
     if status == "confident":
         return category, "validated"
     if status == "ambiguous" and score >= 0.85:
@@ -130,6 +122,20 @@ def _run_extraction(run_id: str, source_name: str) -> None:
 
         statement_tables = _build_statement_tables(result, tables)
         statement_counts = {key: len(bucket["tables"]) for key, bucket in statement_tables.items()}
+
+        # Persist the three core streams independently. These are intentionally
+        # lightweight agent-facing views over the same source evidence.
+        for key in STATEMENT_TYPES:
+            payload = {
+                "schema_version": "1.0",
+                "statement_type": key,
+                "statement_label": STATEMENT_LABELS[key],
+                "source_file": source_name,
+                "status": statement_tables[key]["status"],
+                "pages": statement_tables[key]["pages"],
+                "tables": statement_tables[key]["tables"],
+            }
+            (run_dir / f"{key}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
         payload = {
             "run_id": run_id,
