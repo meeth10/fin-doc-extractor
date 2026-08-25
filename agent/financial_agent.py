@@ -11,22 +11,22 @@ SYSTEM_PROMPT = """You are a financial analyst answering questions about one com
 Rules:
 1. Use only the supplied evidence. Never invent a number.
 2. Prefer a directly reported line item over a derived value.
-3. If the requested metric is absent from the evidence, return status=not_available and answer=null.
+3. If the requested metric is absent, return status=not_available and answer=null.
 4. If the evidence conflicts or the period cannot be identified, return status=ambiguous.
 5. A derived metric must show the formula and its input values.
 6. Preserve the document's currency and unit.
 7. Return JSON only with this shape:
 {
-  \"metric\": string,
-  \"answer\": number|string|null,
-  \"period\": string|null,
-  \"currency\": string|null,
-  \"unit\": string|null,
-  \"status\": \"reported\"|\"derived\"|\"ambiguous\"|\"not_available\",
-  \"confidence\": \"high\"|\"medium\"|\"low\",
-  \"formula\": string|null,
-  \"inputs\": [{\"name\": string, \"value\": number|string, \"page\": number|null}],
-  \"explanation\": string|null
+  "metric": string,
+  "answer": number|string|null,
+  "period": string|null,
+  "currency": string|null,
+  "unit": string|null,
+  "status": "reported"|"derived"|"ambiguous"|"not_available",
+  "confidence": "high"|"medium"|"low",
+  "formula": string|null,
+  "inputs": [{"name": string, "value": number|string, "page": number|null}],
+  "explanation": string|null
 }
 """
 
@@ -37,30 +37,104 @@ def _requested_year(question: str) -> Optional[str]:
 
 
 def _select_reported_candidate(question: str, evidence: Dict[str, Any]) -> Optional[Tuple[float | str, Optional[str], Dict[str, Any]]]:
-    """Answer straightforward reported line-item questions without an LLM."""
     requested = _requested_year(question)
     pools = list(evidence.get("candidates", [])) + list(evidence.get("raw_evidence", []))
     for candidate in pools:
-        if not candidate.get("values"):
+        values = candidate.get("values") or []
+        if not values:
             continue
-        values = candidate["values"]
         periods = candidate.get("periods") or []
         if requested:
             for idx, period in enumerate(periods):
                 if requested in period and idx < len(values):
                     return values[idx], period, candidate
             continue
-        # For a latest/most recent request, annual-report tables normally list
-        # the latest period first. We preserve the source ordering rather than
-        # inventing a period mapping.
         return values[0], periods[0] if periods else None, candidate
     return None
+
+
+def _find_first(evidence: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
+    items = evidence.get("related", {}).get(name) or []
+    return items[0] if items else None
+
+
+def _select_value(question: str, candidate: Dict[str, Any]) -> Tuple[Optional[float | str], Optional[str]]:
+    requested = _requested_year(question)
+    values = candidate.get("values") or []
+    periods = candidate.get("periods") or []
+    if not values:
+        return None, None
+    if requested:
+        for idx, period in enumerate(periods):
+            if requested in period and idx < len(values):
+                return values[idx], period
+    return values[0], periods[0] if periods else None
+
+
+def _derived_ebitda(question: str, evidence: Dict[str, Any]) -> Optional[FinancialAnswer]:
+    # Prefer an explicitly reported EBITDA line.
+    explicit = _select_reported_candidate(question, evidence)
+    if explicit:
+        value, period, source = explicit
+        metadata = evidence.get("document", {}).get("metadata", {}) or {}
+        return FinancialAnswer(
+            metric="ebitda",
+            answer=value,
+            period=period,
+            currency=metadata.get("currency"),
+            unit=metadata.get("unit") or metadata.get("currency_unit"),
+            status="reported",
+            confidence="high" if source.get("validated") else "medium",
+            formula=None,
+            inputs=[],
+            sources=evidence_sources(evidence.get("candidates", []), evidence.get("raw_evidence", []))[:3],
+            explanation="EBITDA is explicitly reported in the source evidence.",
+        )
+
+    ebit = _find_first(evidence, "ebit")
+    depreciation = _find_first(evidence, "depreciation")
+    if not ebit or not depreciation:
+        return None
+
+    ebit_value, ebit_period = _select_value(question, ebit)
+    dep_value, dep_period = _select_value(question, depreciation)
+    if not isinstance(ebit_value, (int, float)) or not isinstance(dep_value, (int, float)):
+        return None
+    if ebit_period and dep_period and ebit_period != dep_period:
+        return None
+
+    period = ebit_period or dep_period
+    metadata = evidence.get("document", {}).get("metadata", {}) or {}
+    answer = float(ebit_value) + float(dep_value)
+    input_pages = [
+        {"name": "EBIT", "value": ebit_value, "page": ebit.get("page")},
+        {"name": "Depreciation", "value": dep_value, "page": depreciation.get("page")},
+    ]
+    refs = evidence_sources(
+        evidence.get("candidates", []) + (evidence.get("related", {}).get("ebit") or []) + (evidence.get("related", {}).get("depreciation") or []),
+        evidence.get("raw_evidence", []),
+    )
+    return FinancialAnswer(
+        metric="ebitda",
+        answer=answer,
+        period=period,
+        currency=metadata.get("currency"),
+        unit=metadata.get("unit") or metadata.get("currency_unit"),
+        status="derived",
+        confidence="high",
+        formula="EBIT + depreciation & amortisation",
+        inputs=input_pages,
+        sources=refs[:5],
+        explanation="No explicit EBITDA line was used; EBITDA was derived from EBIT plus depreciation/amortisation for the same reporting period.",
+    )
 
 
 def _direct_answer(question: str, evidence: Dict[str, Any]) -> Optional[FinancialAnswer]:
     metric = evidence.get("metric")
     if not metric:
         return None
+    if metric == "ebitda":
+        return _derived_ebitda(question, evidence)
     selected = _select_reported_candidate(question, evidence)
     if not selected:
         return None
@@ -109,6 +183,14 @@ def _validate(payload: Dict[str, Any], evidence: Dict[str, Any]) -> FinancialAns
     )
 
 
+def _needs_llm(question: str, metric: str) -> bool:
+    q = question.lower()
+    analytical = ("why", "how", "explain", "driver", "changed", "change", "grew", "growth", "margin", "compare", "versus", "vs", "trend")
+    if any(word in q for word in analytical):
+        return True
+    return metric not in {"cash_and_equivalents", "revenue", "ebitda", "ebit", "pat", "pbt", "finance_costs", "total_debt", "cfo", "capex", "total_assets", "total_equity", "eps"}
+
+
 def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     evidence = build_evidence(question, data)
     if not evidence.get("metric"):
@@ -122,7 +204,7 @@ def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         }
 
     direct = _direct_answer(question, evidence)
-    if direct is not None and evidence.get("metric") != "ebitda":
+    if direct is not None and not _needs_llm(question, evidence["metric"]):
         return {**direct.as_dict(), "evidence": evidence}
 
     user_prompt = (
