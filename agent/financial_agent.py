@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+import re
+from typing import Any, Dict, Optional, Tuple
 
 from extractor.financial_resolver import build_evidence, evidence_sources
 from extractor.financial_schema import FinancialAnswer
@@ -30,6 +31,56 @@ Rules:
 """
 
 
+def _requested_year(question: str) -> Optional[str]:
+    m = re.search(r"\b(?:fy\s*)?(20\d{2}(?:[-/–]\d{2})?)\b", question, re.I)
+    return m.group(1) if m else None
+
+
+def _select_reported_candidate(question: str, evidence: Dict[str, Any]) -> Optional[Tuple[float | str, Optional[str], Dict[str, Any]]]:
+    """Answer straightforward reported line-item questions without an LLM."""
+    requested = _requested_year(question)
+    pools = list(evidence.get("candidates", [])) + list(evidence.get("raw_evidence", []))
+    for candidate in pools:
+        if not candidate.get("values"):
+            continue
+        values = candidate["values"]
+        periods = candidate.get("periods") or []
+        if requested:
+            for idx, period in enumerate(periods):
+                if requested in period and idx < len(values):
+                    return values[idx], period, candidate
+            continue
+        # For a latest/most recent request, annual-report tables normally list
+        # the latest period first. We preserve the source ordering rather than
+        # inventing a period mapping.
+        return values[0], periods[0] if periods else None, candidate
+    return None
+
+
+def _direct_answer(question: str, evidence: Dict[str, Any]) -> Optional[FinancialAnswer]:
+    metric = evidence.get("metric")
+    if not metric:
+        return None
+    selected = _select_reported_candidate(question, evidence)
+    if not selected:
+        return None
+    value, period, source = selected
+    metadata = evidence.get("document", {}).get("metadata", {}) or {}
+    return FinancialAnswer(
+        metric=metric,
+        answer=value,
+        period=period,
+        currency=metadata.get("currency"),
+        unit=metadata.get("unit") or metadata.get("currency_unit"),
+        status="reported",
+        confidence="high" if source.get("validated") else "medium",
+        formula=None,
+        inputs=[],
+        sources=evidence_sources(evidence.get("candidates", []), evidence.get("raw_evidence", []))[:3],
+        explanation=f"Directly reported under {source.get('table_title') or source.get('matched_alias') or metric}.",
+    )
+
+
 def _validate(payload: Dict[str, Any], evidence: Dict[str, Any]) -> FinancialAnswer:
     required = {"metric", "answer", "period", "currency", "unit", "status", "confidence", "formula", "inputs", "explanation"}
     missing = required - set(payload)
@@ -39,13 +90,12 @@ def _validate(payload: Dict[str, Any], evidence: Dict[str, Any]) -> FinancialAns
         raise RuntimeError("Ollama returned an invalid financial status.")
     if payload["confidence"] not in {"high", "medium", "low"}:
         raise RuntimeError("Ollama returned an invalid confidence.")
-    metric = evidence.get("metric") or payload["metric"]
     if payload["status"] != "not_available" and payload["answer"] is None:
         raise RuntimeError("Non-available answer cannot have a null value.")
     if payload["status"] == "not_available" and payload["answer"] is not None:
         raise RuntimeError("A not_available answer must have a null value.")
     return FinancialAnswer(
-        metric=metric,
+        metric=evidence.get("metric") or payload["metric"],
         answer=payload["answer"],
         period=payload["period"],
         currency=payload["currency"],
@@ -70,6 +120,10 @@ def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "message": "I could not map that question to a supported financial metric yet.",
             "evidence": evidence,
         }
+
+    direct = _direct_answer(question, evidence)
+    if direct is not None and evidence.get("metric") != "ebitda":
+        return {**direct.as_dict(), "evidence": evidence}
 
     user_prompt = (
         "Answer the question using ONLY this evidence.\n\n"
