@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fin-doc-extractor"
+version = "0.1.0"
+description = "Financial document extraction engine for PDFs"
+requires-python = ">=3.11"
+dependencies = [
+    "pymupdf",
+    "pdfplumber",
+    "pypdf",
+    "pypdfium2",
+    "pytesseract",
+    "pandas",
+    "numpy",
+]
+
+[tool.setuptools]
+packages = ["extractor"]
