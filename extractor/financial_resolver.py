@@ -10,58 +10,30 @@ METRIC_ALIASES: Dict[str, List[str]] = {
         "cash and cash equivalents", "cash & cash equivalents", "cash equivalents",
         "cash and bank balances", "cash balances", "cash and balances with banks",
     ],
-    "revenue": [
-        "revenue from operations", "revenue", "total revenue", "sales", "turnover",
-    ],
+    "revenue": ["revenue from operations", "revenue", "total revenue", "sales", "turnover"],
     "ebitda": ["ebitda", "operating ebitda", "adjusted ebitda"],
     "ebit": ["ebit", "operating profit", "profit from operations", "operating income"],
     "depreciation": ["depreciation", "depreciation and amortisation", "depreciation & amortisation"],
-    "pat": [
-        "profit for the year", "profit for the period", "profit after tax", "net profit",
-        "profit attributable to owners", "net income",
-    ],
-    "pbt": [
-        "profit before tax", "profit before income tax", "profit before taxes", "pre-tax profit",
-    ],
+    "pat": ["profit for the year", "profit for the period", "profit after tax", "net profit", "profit attributable to owners", "net income"],
+    "pbt": ["profit before tax", "profit before income tax", "profit before taxes", "pre-tax profit"],
     "finance_costs": ["finance costs", "finance cost", "interest expense", "interest costs"],
-    "total_debt": [
-        "total debt", "borrowings", "total borrowings", "debt", "non-current borrowings",
-        "current borrowings",
-    ],
-    "cfo": [
-        "cash flow from operating activities", "net cash generated from operating activities",
-        "cash generated from operations",
-    ],
-    "capex": [
-        "capital expenditure", "purchase of property", "purchase of property, plant and equipment",
-        "purchase of fixed assets", "additions to property, plant and equipment",
-    ],
+    "total_debt": ["total debt", "borrowings", "total borrowings", "debt", "non-current borrowings", "current borrowings"],
+    "cfo": ["cash flow from operating activities", "net cash generated from operating activities", "cash generated from operations"],
+    "capex": ["capital expenditure", "purchase of property", "purchase of property, plant and equipment", "purchase of fixed assets", "additions to property, plant and equipment"],
     "total_assets": ["total assets"],
     "total_equity": ["total equity", "equity attributable to owners", "shareholders' equity"],
     "eps": ["earnings per share", "basic earnings per share", "diluted earnings per share"],
 }
 
 QUESTION_ALIASES = {
-    "cash": "cash_and_equivalents",
-    "cash balance": "cash_and_equivalents",
-    "cash position": "cash_and_equivalents",
-    "revenue": "revenue",
-    "sales": "revenue",
-    "ebitda": "ebitda",
-    "ebit": "ebit",
-    "profit after tax": "pat",
-    "pat": "pat",
-    "net profit": "pat",
-    "pbt": "pbt",
-    "debt": "total_debt",
-    "total debt": "total_debt",
-    "operating cash flow": "cfo",
-    "cfo": "cfo",
-    "capex": "capex",
-    "free cash flow": "fcf",
+    "cash balance": "cash_and_equivalents", "cash position": "cash_and_equivalents", "cash": "cash_and_equivalents",
+    "revenue": "revenue", "sales": "revenue", "ebitda": "ebitda", "ebit": "ebit",
+    "profit after tax": "pat", "pat": "pat", "net profit": "pat", "pbt": "pbt",
+    "debt": "total_debt", "total debt": "total_debt", "operating cash flow": "cfo", "cfo": "cfo",
+    "capex": "capex", "free cash flow": "fcf",
 }
 
-NUMBER_RE = re.compile(r"(?:₹|$|€|£)?\s*[-−(]?\s*\d[\d,]*(?:\.\d+)?\s*\)?%?")
+NUMBER_RE = re.compile(r"(?:₹|\$|€|£)?\s*[-−(]?\s*\d[\d,]*(?:\.\d+)?\s*\)?%?")
 YEAR_RE = re.compile(r"(?:FY\s*)?20\d{2}(?:[-/–]\d{2})?", re.I)
 
 
@@ -85,7 +57,7 @@ def _number(value: Any) -> Optional[float]:
 
 
 def _periods(rows: List[List[str]]) -> List[str]:
-    for row in rows[:4]:
+    for row in rows[:6]:
         found = YEAR_RE.findall(" ".join(row))
         if found:
             return found
@@ -132,19 +104,57 @@ def resolve_metric(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
             if not values:
                 continue
             candidates.append({
-                "metric": metric,
-                "matched_alias": matched,
-                "values": values,
-                "periods": periods,
-                "page": page,
-                "statement": statement_type,
-                "table_title": title,
-                "source": table.get("source"),
+                "metric": metric, "matched_alias": matched, "values": values,
+                "periods": periods, "page": page, "statement": statement_type,
+                "table_title": title, "source": table.get("source"),
                 "score": float(table.get("score", 0) or 0),
                 "validated": bool(table.get("validated")),
                 "assignment": table.get("statement_assignment"),
             })
     return sorted(candidates, key=lambda x: (not x["validated"], -x["score"], x["page"] or 10**9))
+
+
+def resolve_raw_text(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    aliases = METRIC_ALIASES.get(metric, [])
+    results: List[Dict[str, Any]] = []
+    for page in (data.get("document", {}).get("pages") or []):
+        text = str(page.get("raw_text") or "")
+        lower = _norm(text)
+        matched = next((a for a in aliases if _norm(a) in lower), None)
+        if not matched:
+            continue
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for i, line in enumerate(lines):
+            if _norm(matched) not in _norm(line):
+                continue
+            window = lines[i:i + 8]
+            values: List[float] = []
+            for item in window[1:]:
+                numbers = NUMBER_RE.findall(item)
+                for token in numbers:
+                    number = _number(token)
+                    if number is not None:
+                        values.append(number)
+                if len(values) >= 4:
+                    break
+            if values:
+                period_matches = YEAR_RE.findall(" ".join(lines[max(0, i - 6):i + 2]))
+                results.append({
+                    "metric": metric,
+                    "matched_alias": matched,
+                    "values": values[:4],
+                    "periods": period_matches,
+                    "page": page.get("page_number_human"),
+                    "statement": None,
+                    "table_title": None,
+                    "source": "raw_text",
+                    "score": 0.6,
+                    "validated": True,
+                    "assignment": "raw_text_fallback",
+                    "snippet": "\n".join(window),
+                })
+                break
+    return results
 
 
 def metric_from_question(question: str) -> Optional[str]:
@@ -158,15 +168,16 @@ def metric_from_question(question: str) -> Optional[str]:
 def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     metric = metric_from_question(question)
     candidates = resolve_metric(metric, data) if metric else []
-    related = {}
+    raw_evidence = resolve_raw_text(metric, data)[:5] if metric else []
+    related: Dict[str, Any] = {}
 
     if metric == "ebitda":
-        related["ebit"] = resolve_metric("ebit", data)[:3]
-        related["depreciation"] = resolve_metric("depreciation", data)[:3]
-        related["pbt"] = resolve_metric("pbt", data)[:3]
-        related["finance_costs"] = resolve_metric("finance_costs", data)[:3]
+        related["ebit"] = resolve_metric("ebit", data)[:3] or resolve_raw_text("ebit", data)[:3]
+        related["depreciation"] = resolve_metric("depreciation", data)[:3] or resolve_raw_text("depreciation", data)[:3]
+        related["pbt"] = resolve_metric("pbt", data)[:3] or resolve_raw_text("pbt", data)[:3]
+        related["finance_costs"] = resolve_metric("finance_costs", data)[:3] or resolve_raw_text("finance_costs", data)[:3]
 
-    evidence = {
+    return {
         "question": question,
         "metric": metric,
         "document": {
@@ -174,23 +185,18 @@ def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "metadata": data.get("summary", {}).get("metadata", {}),
         },
         "candidates": candidates[:5],
+        "raw_evidence": raw_evidence,
         "related": related,
     }
-    return evidence
 
 
-def evidence_sources(candidates: List[Dict[str, Any]]) -> List[EvidenceRef]:
-    refs = []
+def evidence_sources(candidates: List[Dict[str, Any]], raw_evidence: Optional[List[Dict[str, Any]]] = None) -> List[EvidenceRef]:
+    refs: List[EvidenceRef] = []
     seen = set()
-    for item in candidates:
-        key = (item.get("page"), item.get("statement"), item.get("table_title"))
+    for item in list(candidates) + list(raw_evidence or []):
+        key = (item.get("page"), item.get("statement"), item.get("table_title"), item.get("source"))
         if key in seen:
             continue
         seen.add(key)
-        refs.append(EvidenceRef(
-            page=item.get("page"),
-            statement=item.get("statement"),
-            table_title=item.get("table_title"),
-            source=item.get("source"),
-        ))
+        refs.append(EvidenceRef(page=item.get("page"), statement=item.get("statement"), table_title=item.get("table_title"), source=item.get("source")))
     return refs
