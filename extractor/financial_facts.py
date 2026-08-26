@@ -3,11 +3,9 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List
 
 from .financial_resolver import (
-    METRIC_ALIASES,
     compute_ebitda,
     compute_enterprise_value,
     resolve_metric,
-    resolve_raw_text,
 )
 
 CORE_METRICS = (
@@ -35,7 +33,11 @@ def _period_value_pairs(candidate: Dict[str, Any]) -> Iterable[tuple[str | None,
 
 
 def _candidate_facts(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    candidates = resolve_metric(metric, data) or resolve_raw_text(metric, data)
+    # The normalized fact store is deliberately stricter than the evidence
+    # layer. Raw-text matches remain visible to the agent, but they do not
+    # become canonical facts unless they have first been represented as a
+    # validated statement table.
+    candidates = [c for c in resolve_metric(metric, data) if c.get("validated")]
     facts: List[Dict[str, Any]] = []
     for candidate in candidates:
         for period, value in _period_value_pairs(candidate):
@@ -44,7 +46,7 @@ def _candidate_facts(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "value": value,
                 "period": period,
                 "status": "reported",
-                "confidence": "high" if candidate.get("validated") else "medium",
+                "confidence": "high",
                 "page": candidate.get("page"),
                 "statement": candidate.get("statement"),
                 "table_title": candidate.get("table_title"),
@@ -100,7 +102,7 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
 
     facts.sort(key=lambda x: (x.get("metric") or "", str(x.get("period") or ""), x.get("page") or 10**9))
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "document": {
             "source_name": data.get("summary", {}).get("source_name"),
             "currency": metadata.get("currency"),
