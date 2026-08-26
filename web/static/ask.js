@@ -22,7 +22,7 @@
             <h1>Ask Financials</h1>
             <p>Ask about the loaded document. Evidence is resolved first, then Ollama validates and explains the answer.</p>
           </div>
-          <div class="ollama-pill">Ollama · qwen3:8b · 16K context</div>
+          <div class="ollama-pill">Ollama · qwen3:8b · 32K context</div>
         </div>
         <div class="ask-box">
           <textarea id="ask-input" class="ask-input" autocomplete="off" spellcheck="false" aria-label="Financial question" placeholder="What was cash at FY2025?\n\nOr: What was EBITDA? Was it reported or derived?"></textarea>
@@ -111,7 +111,6 @@
     return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  // Capture navigation clicks before the legacy renderer handles them.
   document.addEventListener('click', event => {
     const button = event.target.closest?.('#main-nav button[data-view="ask"]');
     if (!button) return;
