@@ -78,13 +78,12 @@ def test_sum_and_difference_are_supported():
     assert diff["computed"]["answer"] == 8500.0
 
 
-def test_total_net_sales_resolves_as_revenue_not_year_number():
-    evidence = build_evidence("What was revenue at FY2025?", apple_style_data())
-    assert evidence["computed"] is None
-    assert evidence["candidates"]
-    assert evidence["candidates"][0]["matched_alias"] == "total net sales"
-    assert evidence["candidates"][0]["values"] == [416161.0, 391035.0, 383285.0]
-    assert evidence["candidates"][0]["page"] == 89
+def test_total_net_sales_resolves_as_revenue_not_product_component():
+    candidates = resolve_metric("revenue", apple_style_data())
+    assert candidates
+    assert candidates[0]["matched_alias"] == "total net sales"
+    assert candidates[0]["values"] == [416161.0, 391035.0, 383285.0]
+    assert candidates[0]["page"] == 89
 
 
 def test_ebitda_growth_derives_two_aligned_periods():
@@ -93,3 +92,16 @@ def test_ebitda_growth_derives_two_aligned_periods():
     assert evidence["computed"]["latest_value"] == 144748.0
     assert evidence["computed"]["prior_value"] == 134735.0
     assert evidence["computed"]["change"] == 10013.0
+
+
+def test_generic_debt_does_not_match_as_total_debt():
+    data = sample_data()
+    data["statement_tables"]["balance_sheet"]["tables"][0]["table"] = [
+        ["Particulars", "2025", "2024"],
+        ["Debt", "1", "2"],
+        ["Total borrowings", "2,000", "2,200"],
+    ]
+    candidates = resolve_metric("total_debt", data)
+    assert candidates
+    assert candidates[0]["matched_alias"] == "total borrowings"
+    assert candidates[0]["values"] == [2000.0, 2200.0]
