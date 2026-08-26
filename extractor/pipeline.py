@@ -27,7 +27,6 @@ TITLE_PATTERNS = {
         r"^(?:consolidated\s+)?profit\s+and\s+loss\s+statements?(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
         r"^(?:consolidated\s+)?statements?\s+of\s+profit\s+and\s+loss(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
         r"^(?:consolidated\s+)?income\s+statements?(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
-        r"^(?:consolidated\s+)?statements?\s+of\s+comprehensive\s+income(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
         r"^(?:consolidated\s+)?statements?\s+of\s+income(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
     ],
     "cash_flow": [
@@ -37,6 +36,17 @@ TITLE_PATTERNS = {
 }
 _TITLE_RE = {k: [re.compile(p, re.I) for p in v] for k, v in TITLE_PATTERNS.items()}
 YEAR_RE = re.compile(r"\b(?:FY\s*)?20\d{2}(?:[-/–]\d{2})?\b", re.I)
+INDEX_MARKERS = (
+    "index to consolidated financial statements",
+    "index to financial statements",
+    "financial statements and supplementary data",
+    "table of contents",
+)
+RELATED_STATEMENT_MARKERS = (
+    "statements of comprehensive income",
+    "statement of comprehensive income",
+    "other comprehensive income",
+)
 
 
 def _progress(callback: ProgressCallback, percent: int, message: str) -> None:
@@ -88,12 +98,20 @@ def _looks_title_like(normalized: str) -> bool:
     return not any(marker in normalized.lower() for marker in markers)
 
 
+def _page_is_excluded_from_primary(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+    return any(marker in normalized for marker in INDEX_MARKERS + RELATED_STATEMENT_MARKERS)
+
+
 def _primary_title(page_text: str) -> Optional[Dict]:
     lines = _nonempty_lines(page_text)
     for idx, line in enumerate(lines[:18]):
         normalized = re.sub(r"\s+", " ", line).strip()
+        lower = normalized.lower()
         if not normalized or len(normalized) > 140 or not _looks_title_like(normalized):
             continue
+        if any(marker in lower for marker in INDEX_MARKERS + RELATED_STATEMENT_MARKERS):
+            return None
         for statement_type, patterns in _TITLE_RE.items():
             if any(p.fullmatch(normalized) for p in patterns):
                 context = " ".join(lines[idx:idx + 5])
@@ -104,10 +122,11 @@ def _primary_title(page_text: str) -> Optional[Dict]:
 def _annotate_page_titles(page_records: List[Dict]) -> None:
     for record in page_records:
         record["statement_title"] = _primary_title(record["text"])
+        record["statement_excluded"] = _page_is_excluded_from_primary(record["text"])
 
 
 def _statement_sequence_candidates(page_records: List[Dict], table_records: List[Dict]) -> Dict[str, List[int]]:
-    """Pick the most likely BS -> IS -> CF cluster when all three appear within 5 pages."""
+    """Find the strongest BS/IS/CF title cluster within five pages, regardless of order."""
     titles: Dict[str, List[Dict]] = {t: [] for t in TARGET_STATEMENTS}
     for record in page_records:
         title = record.get("statement_title")
@@ -119,21 +138,19 @@ def _statement_sequence_candidates(page_records: List[Dict], table_records: List
         if table["validated"]:
             table_score[table["page_number"]] = max(table_score.get(table["page_number"], 0.0), float(table["score"]))
             table_validated[table["page_number"]] = True
+
     combos = []
     for bs in titles["balance_sheet"]:
         for inc in titles["income_statement"]:
             for cf in titles["cash_flow"]:
-                if not bs["page"] < inc["page"] < cf["page"]:
+                pages = [bs["page"], inc["page"], cf["page"]]
+                span = max(pages) - min(pages)
+                if len(set(pages)) != 3 or span > SEQUENCE_MAX_SPAN:
                     continue
-                span = cf["page"] - bs["page"]
-                if span > SEQUENCE_MAX_SPAN:
-                    continue
-                gap1 = inc["page"] - bs["page"]
-                gap2 = cf["page"] - inc["page"]
-                proximity = 1.0 / (1.0 + span) + 1.0 / (1.0 + gap1) + 1.0 / (1.0 + gap2)
-                year_support = 0.4 * sum(int(x["year"]) for x in (bs, inc, cf))
-                table_support = sum(table_score.get(p, 0.0) for p in (bs["page"], inc["page"], cf["page"]))
-                validation_support = sum(int(table_validated.get(p, False)) for p in (bs["page"], inc["page"], cf["page"]))
+                proximity = sum(1.0 / (1.0 + abs(pages[i] - pages[j])) for i, j in ((0, 1), (0, 2), (1, 2)))
+                year_support = 0.75 * sum(int(x["year"]) for x in (bs, inc, cf))
+                table_support = sum(table_score.get(p, 0.0) for p in pages)
+                validation_support = sum(int(table_validated.get(p, False)) for p in pages)
                 score = 10.0 + proximity + year_support + table_support + 1.5 * validation_support - 0.75 * span
                 combos.append((score, bs["page"], inc["page"], cf["page"]))
     if combos:
@@ -143,12 +160,13 @@ def _statement_sequence_candidates(page_records: List[Dict], table_records: List
 
 
 def _attach_statement_types(page_records: List[Dict], table_records: List[Dict]) -> Dict[str, List[int]]:
-    """High-precision statement classification with three-statement clustering."""
+    """Assign statement types using page titles, cluster proximity and explicit exclusions."""
     _annotate_page_titles(page_records)
     selected = _statement_sequence_candidates(page_records, table_records)
     title_by_page = {r["page_number"]: r.get("statement_title") for r in page_records}
+    excluded_pages = {r["page_number"] for r in page_records if r.get("statement_excluded")}
     selected_pages = [selected[t][0] for t in TARGET_STATEMENTS if selected.get(t)]
-    complete_cluster = len(selected_pages) == 3 and selected["balance_sheet"][0] < selected["income_statement"][0] < selected["cash_flow"][0] and selected_pages[-1] - selected_pages[0] <= SEQUENCE_MAX_SPAN
+    complete_cluster = len(selected_pages) == 3 and (max(selected_pages) - min(selected_pages) <= SEQUENCE_MAX_SPAN)
 
     for table in table_records:
         table["statement_type"] = None
@@ -159,7 +177,7 @@ def _attach_statement_types(page_records: List[Dict], table_records: List[Dict])
 
     for statement_type, pages in selected.items():
         for table in table_records:
-            if table["validated"] and table["page_number"] in pages:
+            if table["validated"] and table["page_number"] in pages and table["page_number"] not in excluded_pages:
                 table["statement_type"] = statement_type
                 table["statement_assignment"] = "title" if complete_cluster else "title_candidate"
                 table["statement_confidence"] = 1.0 if complete_cluster else 0.82
@@ -171,6 +189,8 @@ def _attach_statement_types(page_records: List[Dict], table_records: List[Dict])
             if table["statement_type"] is not None or not table["validated"]:
                 continue
             pn = table["page_number"]
+            if pn in excluded_pages:
+                continue
             for idx, (start, kind) in enumerate(ordered):
                 next_start = ordered[idx + 1][0] if idx + 1 < len(ordered) else cluster_end + MAX_CONTINUATION_PAGES + 1
                 if start < pn < next_start and pn <= start + MAX_CONTINUATION_PAGES:
@@ -180,9 +200,9 @@ def _attach_statement_types(page_records: List[Dict], table_records: List[Dict])
                     break
     else:
         for table in table_records:
-            if table["statement_type"] is None:
+            if table["statement_type"] is None and table["validated"] and table["page_number"] not in excluded_pages:
                 title = title_by_page.get(table["page_number"])
-                if title and title["statement_type"] in TARGET_STATEMENTS and table["validated"]:
+                if title and title["statement_type"] in TARGET_STATEMENTS:
                     table["statement_type"] = title["statement_type"]
                     table["statement_assignment"] = "title_candidate"
                     table["statement_confidence"] = 0.82
@@ -249,7 +269,7 @@ def extract(pdf_path: str, out_dir: str = None, include_notes: bool = False, deb
         output_pages.append({"page_number": pn, "page_number_human": pn + 1, "extraction_method": r["method"], "raw_text": r["text"], "table_candidate_count": len(page_tables), "best_table": best_by_page.get(pn), "tables": [t["table"] for t in page_tables if t["validated"]]})
     result = {"schema_version": "2.3", "source_file": pdf_path, "total_pages": total_pages, "document_metadata": doc_metadata.as_dict(), "sections_found": sections, "ambiguous_pages": [p + 1 for p in ambiguous_pages], "flagged_page_count": len(flagged_pages), "pages": output_pages, "statement_tables": isolated_statements, "table_summary": {"candidate_count": len(table_records), "validated_count": len(validated), "pages_with_validated_tables": len(best_by_page), "best_document_table": max(validated, key=lambda t: t["score"], default=None)}, "elapsed_seconds": round(time.time() - t0, 2)}
     if debug:
-        result["_debug"] = {"page_scores": [{"page_number_human": s.page_number + 1, "status": s.status, "best_category": s.best_category, "confidence": s.confidence, "category_scores": s.category_scores, "signals": s.signals} for s in page_scores if s.status != "none"], "table_candidates": [{k: v for k, v in t.items() if k not in {"table"}} for t in table_records]}
+        result["_debug"] = {"page_scores": [{"page_number_human": s.page_number + 1, "status": s.status, "best_category": s.best_category, "confidence": s.confidence, "category_scores": s.category_scores, "signals": s.signals} for s in page_scores if s.status != "none"], "table_candidates": [{k: v for k, v in t.items() if k != "table"} for t in table_records]}
     if out_dir:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
