@@ -18,6 +18,8 @@ METRIC_ALIASES: Dict[str, List[str]] = {
     "pbt": ["profit before tax", "profit before income tax", "profit before taxes", "pre-tax profit"],
     "finance_costs": ["finance costs", "finance cost", "interest expense", "interest costs"],
     "total_debt": ["total debt", "borrowings", "total borrowings", "debt", "non-current borrowings", "current borrowings"],
+    "market_capitalization": ["market capitalization", "market capitalisation", "market cap"],
+    "enterprise_value": ["enterprise value", "enterprise valuation", "ev"],
     "cfo": ["cash flow from operating activities", "net cash generated from operating activities", "cash generated from operations"],
     "capex": ["capital expenditure", "purchase of property", "purchase of property, plant and equipment", "purchase of fixed assets", "additions to property, plant and equipment"],
     "total_assets": ["total assets"],
@@ -29,8 +31,9 @@ QUESTION_ALIASES = {
     "cash balance": "cash_and_equivalents", "cash position": "cash_and_equivalents", "cash": "cash_and_equivalents",
     "revenue": "revenue", "sales": "revenue", "ebitda": "ebitda", "ebit": "ebit",
     "profit after tax": "pat", "pat": "pat", "net profit": "pat", "pbt": "pbt",
-    "debt": "total_debt", "total debt": "total_debt", "operating cash flow": "cfo", "cfo": "cfo",
-    "capex": "capex", "free cash flow": "fcf",
+    "debt": "total_debt", "total debt": "total_debt", "market cap": "market_capitalization",
+    "market capitalization": "market_capitalization", "enterprise value": "enterprise_value", "ev": "enterprise_value",
+    "operating cash flow": "cfo", "cfo": "cfo", "capex": "capex", "free cash flow": "fcf",
 }
 
 NUMBER_RE = re.compile(r"(?:₹|\$|€|£)?\s*[-−(]?\s*\d[\d,]*(?:\.\d+)?\s*\)?%?")
@@ -165,12 +168,31 @@ def metric_from_question(question: str) -> Optional[str]:
     return None
 
 
+def metrics_from_question(question: str) -> List[str]:
+    text = _norm(question)
+    found: List[str] = []
+    for metric, aliases in METRIC_ALIASES.items():
+        if metric == "enterprise_value":
+            continue
+        for alias in aliases:
+            a = _norm(alias)
+            if a and a in text:
+                if metric not in found:
+                    found.append(metric)
+                break
+    return found
+
+
 def question_intent(question: str) -> str:
     text = _norm(question)
     if any(p in text for p in ("% increase", "percentage increase", "percent increase", "growth rate", "% growth", "grew by")):
         return "yoy_percent"
     if any(p in text for p in ("increase", "decrease", "change", "grew", "decline", "growth", "versus", "vs", "year over year", "yoy")):
         return "yoy_change"
+    if any(p in text for p in ("sum of", "add ", "plus", "combined", "total of")):
+        return "sum"
+    if any(p in text for p in ("difference between", "difference in", "minus", "subtract", "less")):
+        return "difference"
     return "value"
 
 
@@ -191,6 +213,14 @@ def _pick_candidate(question: str, candidates: List[Dict[str, Any]]) -> Optional
         else:
             return candidate
     return None
+
+
+def _select_latest(candidate: Dict[str, Any]) -> Optional[Tuple[float, Optional[str]]]:
+    values = candidate.get("values") or []
+    periods = candidate.get("periods") or []
+    if not values:
+        return None
+    return float(values[0]), periods[0] if periods else None
 
 
 def compute_change(question: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -234,6 +264,77 @@ def compute_change(question: str, candidates: List[Dict[str, Any]]) -> Optional[
     }
 
 
+def compute_arithmetic(question: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    intent = question_intent(question)
+    if intent not in {"sum", "difference"}:
+        return None
+    metrics = metrics_from_question(question)
+    if len(metrics) < 2:
+        return None
+    selected = []
+    for metric in metrics[:2]:
+        candidates = resolve_metric(metric, data) or resolve_raw_text(metric, data)
+        if not candidates:
+            return None
+        latest = _select_latest(candidates[0])
+        if latest is None:
+            return None
+        value, period = latest
+        selected.append((metric, value, period, candidates[0]))
+    (m1, v1, p1, c1), (m2, v2, p2, c2) = selected
+    if p1 and p2 and p1 != p2:
+        return None
+    answer = v1 + v2 if intent == "sum" else v1 - v2
+    formula = f"{m1} + {m2}" if intent == "sum" else f"{m1} − {m2}"
+    return {
+        "metric": f"{m1}_{'plus' if intent == 'sum' else 'minus'}_{m2}",
+        "status": "derived",
+        "answer": round(answer, 2),
+        "period": p1 or p2,
+        "formula": formula,
+        "inputs": [
+            {"name": m1, "value": v1, "page": c1.get("page")},
+            {"name": m2, "value": v2, "page": c2.get("page")},
+        ],
+        "source": {"items": [c1, c2]},
+    }
+
+
+def compute_enterprise_value(question: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    explicit = resolve_metric("enterprise_value", data) or resolve_raw_text("enterprise_value", data)
+    if explicit:
+        latest = _select_latest(explicit[0])
+        if latest:
+            value, period = latest
+            return {
+                "metric": "enterprise_value", "status": "reported", "answer": round(value, 2),
+                "period": period, "formula": None,
+                "inputs": [], "source": explicit[0],
+            }
+
+    market = resolve_metric("market_capitalization", data) or resolve_raw_text("market_capitalization", data)
+    debt = resolve_metric("total_debt", data) or resolve_raw_text("total_debt", data)
+    cash = resolve_metric("cash_and_equivalents", data) or resolve_raw_text("cash_and_equivalents", data)
+    if not market or not debt or not cash:
+        return None
+    m = _select_latest(market[0]); d = _select_latest(debt[0]); c = _select_latest(cash[0])
+    if not m or not d or not c:
+        return None
+    mv, mp = m; dv, dp = d; cv, cp = c
+    if len({p for p in (mp, dp, cp) if p}) > 1:
+        return None
+    return {
+        "metric": "enterprise_value", "status": "derived", "answer": round(mv + dv - cv, 2),
+        "period": mp or dp or cp, "formula": "market capitalization + total debt − cash",
+        "inputs": [
+            {"name": "Market capitalization", "value": mv, "page": market[0].get("page")},
+            {"name": "Total debt", "value": dv, "page": debt[0].get("page")},
+            {"name": "Cash & equivalents", "value": cv, "page": cash[0].get("page")},
+        ],
+        "source": {"items": [market[0], debt[0], cash[0]]},
+    }
+
+
 def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     metric = metric_from_question(question)
     candidates = resolve_metric(metric, data) if metric else []
@@ -247,8 +348,12 @@ def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         related["finance_costs"] = resolve_metric("finance_costs", data)[:3] or resolve_raw_text("finance_costs", data)[:3]
 
     computed = None
-    if metric and question_intent(question) != "value":
+    if metric == "enterprise_value":
+        computed = compute_enterprise_value(question, data)
+    elif metric and question_intent(question) in {"yoy_percent", "yoy_change"}:
         computed = compute_change(question, candidates)
+    else:
+        computed = compute_arithmetic(question, data)
 
     return {
         "question": question,
