@@ -27,6 +27,7 @@ TITLE_PATTERNS = {
         r"^(?:consolidated\s+)?profit\s+and\s+loss\s+statements?(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
         r"^(?:consolidated\s+)?statements?\s+of\s+profit\s+and\s+loss(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
         r"^(?:consolidated\s+)?income\s+statements?(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
+        r"^(?:consolidated\s+)?statements?\s+of\s+operations?(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
         r"^(?:consolidated\s+)?statements?\s+of\s+income(?:\s+(?:for\s+the\b|as\s+at\b).*)?$",
     ],
     "cash_flow": [
@@ -269,7 +270,7 @@ def extract(pdf_path: str, out_dir: str = None, include_notes: bool = False, deb
         output_pages.append({"page_number": pn, "page_number_human": pn + 1, "extraction_method": r["method"], "raw_text": r["text"], "table_candidate_count": len(page_tables), "best_table": best_by_page.get(pn), "tables": [t["table"] for t in page_tables if t["validated"]]})
     result = {"schema_version": "2.3", "source_file": pdf_path, "total_pages": total_pages, "document_metadata": doc_metadata.as_dict(), "sections_found": sections, "ambiguous_pages": [p + 1 for p in ambiguous_pages], "flagged_page_count": len(flagged_pages), "pages": output_pages, "statement_tables": isolated_statements, "table_summary": {"candidate_count": len(table_records), "validated_count": len(validated), "pages_with_validated_tables": len(best_by_page), "best_document_table": max(validated, key=lambda t: t["score"], default=None)}, "elapsed_seconds": round(time.time() - t0, 2)}
     if debug:
-        result["_debug"] = {"page_scores": [{"page_number_human": s.page_number + 1, "status": s.status, "best_category": s.best_category, "confidence": s.confidence, "category_scores": s.category_scores, "signals": s.signals} for s in page_scores if s.status != "none"], "table_candidates": [{k: v for k, v in t.items() if k != "table"} for t in table_records]}
+        result["_debug"] = {"page_scores": [{"page_number_human": s.page_number + 1, "status": s.status, "best_category": s.best_category, "confidence": s.confidence, "category_scores": s.category_scores, "signals": s.signals} for s in page_scores if s.status != "none"], "table_candidates": [{k: v for k, v in t.items() if k not in {"table"}} for t in table_records]}
     if out_dir:
         out = Path(out_dir)
         out.mkdir(parents=True, exist_ok=True)
