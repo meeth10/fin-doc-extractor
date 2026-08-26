@@ -17,109 +17,53 @@
     content.innerHTML = `
       <div class="ask-shell">
         <div class="ask-hero">
-          <div>
-            <div class="eyebrow">FINANCIAL Q&A</div>
-            <h1>Ask Financials</h1>
-            <p>Ask about the loaded document. Evidence is resolved first, then Ollama validates and explains the answer.</p>
-          </div>
-          <div class="ollama-pill">Ollama · qwen3:4b · 16K context</div>
+          <div><div class="eyebrow">FINANCIAL Q&A</div><h1>Ask Financials</h1><p>Evidence is resolved first, then Ollama interprets and explains the answer.</p></div>
+          <div class="ollama-pill">Ollama · qwen3:8b · 16K context</div>
         </div>
         <div class="ask-box">
           <textarea id="ask-input" class="ask-input" autocomplete="off" spellcheck="false" aria-label="Financial question" placeholder="What was cash at FY2025?\n\nOr: What was EBITDA? Was it reported or derived?"></textarea>
-          <div class="ask-actions">
-            <div class="ask-hints">
-              <button type="button" data-q="What was cash at the latest reported year?">Cash</button>
-              <button type="button" data-q="What was revenue at the latest reported year?">Revenue</button>
-              <button type="button" data-q="What was EBITDA? Was it reported or derived?">EBITDA</button>
-              <button type="button" data-q="What was total debt at the latest reported year?">Debt</button>
-            </div>
-            <button type="button" id="ask-submit" class="ask-submit">Ask</button>
-          </div>
+          <div class="ask-actions"><div class="ask-hints">
+            <button type="button" data-q="What was cash at the latest reported year?">Cash</button>
+            <button type="button" data-q="What was revenue at the latest reported year?">Revenue</button>
+            <button type="button" data-q="What was EBITDA? Was it reported or derived?">EBITDA</button>
+            <button type="button" data-q="What was enterprise value?">EV</button>
+            <button type="button" data-q="What was total debt at the latest reported year?">Debt</button>
+          </div><button type="button" id="ask-submit" class="ask-submit">Ask</button></div>
         </div>
         <div id="ask-result" class="ask-result"></div>
-        <div class="ask-foot">The resolver provides the source truth for reported figures. Ollama is consulted on every supported financial question, but cannot override a directly extracted source value.</div>
+        <div class="ask-foot">The resolver owns source truth and deterministic finance math. Ollama explains the evidence but cannot override verified values.</div>
       </div>`;
-
     const input = document.querySelector('#ask-input');
-    document.querySelectorAll('.ask-hints button').forEach(btn => {
-      btn.onclick = () => { input.value = btn.dataset.q; input.focus(); };
-    });
+    document.querySelectorAll('.ask-hints button').forEach(btn => btn.onclick = () => { input.value = btn.dataset.q; input.focus(); });
     document.querySelector('#ask-submit').onclick = submit;
-    input.addEventListener('keydown', e => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit();
-    });
+    input.addEventListener('keydown', e => { if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') submit(); });
     setTimeout(() => input.focus(), 0);
   }
 
   async function submit() {
-    const input = document.querySelector('#ask-input');
-    const button = document.querySelector('#ask-submit');
-    const result = document.querySelector('#ask-result');
-    const question = input?.value.trim();
-    if (!question) return;
-    button.disabled = true;
-    result.innerHTML = '<div class="ask-empty"><h2>Thinking…</h2><p>Resolving evidence and asking Ollama.</p></div>';
+    const input = document.querySelector('#ask-input'); const button = document.querySelector('#ask-submit'); const result = document.querySelector('#ask-result');
+    const question = input?.value.trim(); if (!question) return;
+    button.disabled = true; result.innerHTML = '<div class="ask-empty"><h2>Thinking…</h2><p>Resolving evidence and asking Ollama.</p></div>';
     try {
-      const response = await fetch('/api/ask', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({question})
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.detail || 'Question failed');
-      renderAnswer(payload);
-    } catch (error) {
-      result.innerHTML = `<div class="ask-error">${esc(error.message)}</div>`;
-    } finally {
-      button.disabled = false;
-    }
+      const response = await fetch('/api/ask', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question})});
+      const payload = await response.json(); if (!response.ok) throw new Error(payload.detail || 'Question failed'); renderAnswer(payload);
+    } catch(error) { result.innerHTML = `<div class="ask-error">${esc(error.message)}</div>`; }
+    finally { button.disabled = false; }
   }
 
   function renderAnswer(a) {
-    const result = document.querySelector('#ask-result');
-    if (!result) return;
-    if (!a.metric && a.status === 'ambiguous') {
-      result.innerHTML = `<div class="ask-error">${esc(a.message || 'I could not map that question to a supported financial metric.')}</div>`;
-      return;
-    }
+    const result = document.querySelector('#ask-result'); if (!result) return;
+    if (!a.metric && a.status === 'ambiguous') { result.innerHTML = `<div class="ask-error">${esc(a.message || 'I could not map that question to a supported financial metric.')}</div>`; return; }
     const statusClass = a.status === 'reported' ? 'good' : a.status === 'derived' ? 'derived' : 'warn';
     const value = a.answer === null ? 'Not available' : formatAnswer(a.answer, a.currency, a.unit);
     const sources = (a.sources || []).map(s => `<span class="source-chip">${esc(s.statement || 'Source')} · p.${esc(s.page ?? '—')}${s.table_title ? ` · ${esc(s.table_title)}` : ''}</span>`).join('');
     const inputs = (a.inputs || []).map(i => `<div class="answer-input"><span>${esc(i.name)}</span><strong>${esc(formatAnswer(i.value, a.currency, a.unit))}${i.page ? ` · p.${esc(i.page)}` : ''}</strong></div>`).join('');
-    result.innerHTML = `<article class="answer-card">
-      <div class="answer-top">
-        <div><div class="answer-label">${esc(a.metric || 'FINANCIAL METRIC')}</div><div class="answer-value">${esc(value)}</div></div>
-        <div class="answer-meta"><span class="answer-badge ${statusClass}">${esc(String(a.status || '').toUpperCase())}</span><span class="answer-badge">${esc(String(a.confidence || '').toUpperCase())} CONFIDENCE</span>${a.llm_used ? `<span class="answer-badge ai">LLM · ${esc(a.llm_model || 'Ollama')}</span>` : ''}${a.period ? `<span class="answer-badge">${esc(a.period)}</span>` : ''}</div>
-      </div>
-      ${a.explanation ? `<div class="answer-explanation">${esc(a.explanation)}</div>` : ''}
-      ${a.formula ? `<div class="formula">${esc(a.formula)}</div>` : ''}
-      ${inputs ? `<div class="answer-inputs">${inputs}</div>` : ''}
-      <div class="sources-head">Evidence</div><div class="source-row">${sources || '<span class="source-chip">No direct source recorded</span>'}</div>
-    </article>`;
+    result.innerHTML = `<article class="answer-card"><div class="answer-top"><div><div class="answer-label">${esc(a.metric || 'FINANCIAL METRIC')}</div><div class="answer-value">${esc(value)}</div></div><div class="answer-meta"><span class="answer-badge ${statusClass}">${esc(String(a.status || '').toUpperCase())}</span><span class="answer-badge">${esc(String(a.confidence || '').toUpperCase())} CONFIDENCE</span>${a.llm_used ? `<span class="answer-badge ai">LLM · ${esc(a.llm_model || 'Ollama')}</span>` : ''}${a.period ? `<span class="answer-badge">${esc(a.period)}</span>` : ''}</div></div>${a.explanation ? `<div class="answer-explanation">${esc(a.explanation)}</div>` : ''}${a.formula ? `<div class="formula">${esc(a.formula)}</div>` : ''}${inputs ? `<div class="answer-inputs">${inputs}</div>` : ''}<div class="sources-head">Evidence</div><div class="source-row">${sources || '<span class="source-chip">No direct source recorded</span>'}</div></article>`;
   }
 
-  function formatAnswer(value, currency, unit) {
-    if (value === null || value === undefined) return '—';
-    if (typeof value === 'number') {
-      const number = Number.isInteger(value) ? value.toLocaleString('en-IN') : value.toLocaleString('en-IN', {maximumFractionDigits: 2});
-      return `${currency || ''}${currency ? ' ' : ''}${number}${unit ? ` ${unit}` : ''}`;
-    }
-    return String(value);
-  }
+  function formatAnswer(value, currency, unit) { if (value === null || value === undefined) return '—'; if (typeof value === 'number') { const number = Number.isInteger(value) ? value.toLocaleString('en-IN') : value.toLocaleString('en-IN',{maximumFractionDigits:2}); return `${currency || ''}${currency ? ' ' : ''}${number}${unit ? ` ${unit}` : ''}`; } return String(value); }
+  function esc(value) { return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 
-  function esc(value) {
-    return String(value ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-  }
-
-  // Capture navigation clicks before the legacy renderer handles them.
-  document.addEventListener('click', event => {
-    const button = event.target.closest?.('#main-nav button[data-view="ask"]');
-    if (!button) return;
-    event.preventDefault();
-    event.stopImmediatePropagation();
-    document.querySelectorAll('#main-nav button').forEach(b => b.classList.toggle('active', b === button));
-    window.renderAsk();
-  }, true);
-
+  document.addEventListener('click', event => { const button = event.target.closest?.('#main-nav button[data-view="ask"]'); if (!button) return; event.preventDefault(); event.stopImmediatePropagation(); document.querySelectorAll('#main-nav button').forEach(b => b.classList.toggle('active', b === button)); window.renderAsk(); }, true);
   window.renderAsk = renderAsk;
 })();
