@@ -36,7 +36,7 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=90) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
