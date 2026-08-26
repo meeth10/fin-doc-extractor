@@ -27,6 +27,7 @@ STATEMENT_LABELS = {
     "income_statement": "Income Statement",
     "cash_flow": "Cash Flow",
 }
+CORE_ASSIGNMENTS = {"title", "continuation"}
 
 app = FastAPI(title="Fin Doc Extractor")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
@@ -90,6 +91,22 @@ def _build_statement_tables(result: dict, tables: dict) -> dict:
     return grouped
 
 
+def _core_statement_outputs(statement_tables: dict) -> dict:
+    core = {}
+    for key in STATEMENT_TYPES:
+        bucket = statement_tables.get(key, {})
+        all_tables = bucket.get("tables", [])
+        kept = [t for t in all_tables if t.get("statement_assignment") in CORE_ASSIGNMENTS]
+        core[key] = {
+            **bucket,
+            "tables": kept,
+            "pages": sorted({int(t["page_number_human"]) for t in kept}),
+            "candidate_count": len(all_tables),
+            "status": "validated" if any(t.get("statement_assignment") == "title" for t in kept) else ("provisional" if kept else "empty"),
+        }
+    return core
+
+
 def _run_extraction(run_id: str, source_name: str) -> None:
     run_dir = RUNS / run_id
     pdf_path = run_dir / "source.pdf"
@@ -105,8 +122,10 @@ def _run_extraction(run_id: str, source_name: str) -> None:
             filename = Path(page["path"]).name
             page["url"] = f"/runs/{run_id}/pages/{filename}"
 
-        statement_tables = result.get("statement_tables") or _build_statement_tables(result, tables)
+        extracted_statement_tables = result.get("statement_tables") or _build_statement_tables(result, tables)
+        statement_tables = _core_statement_outputs(extracted_statement_tables)
         statement_counts = {key: len(bucket.get("tables", [])) for key, bucket in statement_tables.items()}
+        candidate_counts = {key: bucket.get("candidate_count", 0) for key, bucket in statement_tables.items()}
 
         fact_input = {
             "summary": {"source_name": source_name, "metadata": result["document_metadata"]},
@@ -117,12 +136,12 @@ def _run_extraction(run_id: str, source_name: str) -> None:
         (run_dir / "financial_facts.json").write_text(json.dumps(fact_store, indent=2, ensure_ascii=False), encoding="utf-8")
 
         for key in STATEMENT_TYPES:
-            payload = {"schema_version": "1.0", "statement_type": key, "statement_label": STATEMENT_LABELS[key], "source_file": source_name, "status": statement_tables[key]["status"], "pages": statement_tables[key]["pages"], "tables": statement_tables[key]["tables"]}
+            payload = {"schema_version": "1.1", "statement_type": key, "statement_label": STATEMENT_LABELS[key], "source_file": source_name, "status": statement_tables[key]["status"], "pages": statement_tables[key]["pages"], "candidate_count": candidate_counts[key], "tables": statement_tables[key]["tables"]}
             (run_dir / f"{key}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
         payload = {
             "run_id": run_id,
-            "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "statement_counts": statement_counts, "fact_count": fact_store["fact_count"], "elapsed_seconds": result["elapsed_seconds"]},
+            "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "statement_counts": statement_counts, "statement_candidate_counts": candidate_counts, "fact_count": fact_store["fact_count"], "elapsed_seconds": result["elapsed_seconds"]},
             "statement_tables": statement_tables,
             "financial_facts": fact_store,
             "document": document,
