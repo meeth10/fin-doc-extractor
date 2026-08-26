@@ -62,6 +62,16 @@ PREFERRED_STATEMENTS = {
     "capex": ("cash_flow",),
 }
 
+PREFERRED_ALIASES = {
+    "revenue": ("total net sales", "net sales", "revenue from operations", "total revenue", "revenue"),
+    "total_debt": ("total debt", "total borrowings"),
+    "cash_and_equivalents": ("cash and cash equivalents", "cash & cash equivalents"),
+    "total_assets": ("total assets",),
+    "total_equity": ("total equity",),
+    "pat": ("net income", "profit for the year", "profit for the period"),
+    "pbt": ("income before provision for income taxes", "profit before tax"),
+}
+
 FINANCIAL_PAGE_MARKERS = (
     "balance sheet", "balance sheets", "financial position", "profit and loss",
     "statements of operations", "statement of operations", "income statement",
@@ -72,6 +82,10 @@ FINANCIAL_PAGE_MARKERS = (
 
 def _norm(text: Any) -> str:
     return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _clean_label(text: Any) -> str:
+    return re.sub(r"[^a-z0-9&' ]+", " ", _norm(text))
 
 
 def _number(value: Any) -> Optional[float]:
@@ -103,32 +117,38 @@ def _iter_tables(data: Dict[str, Any]) -> Iterable[Tuple[str, Dict[str, Any]]]:
             yield statement_type, table
 
 
+def _row_label(row: List[Any]) -> str:
+    return _clean_label(row[0]) if row else ""
+
+
 def _row_match(row: List[Any], aliases: List[str]) -> Optional[str]:
-    cells = [_norm(c) for c in row]
-    label = " ".join(c for c in cells if c)
-    # Prefer a match against the descriptive/label portion of the row. This
-    # prevents short aliases from matching numeric or narrative cells.
+    label = _row_label(row)
+    if not label:
+        return None
     for alias in aliases:
-        a = _norm(alias)
-        if not a:
-            continue
-        if cells and (cells[0] == a or cells[0].startswith(a + " ")):
-            return alias
-    label_match = re.match(r"^(.*?)(?=\s+(?:[$€£₹]?[-(]?\d|\d))", label)
-    label_prefix = _norm(label_match.group(1)) if label_match else label
-    for alias in aliases:
-        a = _norm(alias)
-        if a and re.search(rf"(?<!\w){re.escape(a)}(?!\w)", label_prefix):
+        a = _clean_label(alias)
+        if label == a or label.startswith(a + " "):
             return alias
     return None
 
 
 def _candidate_sort_key(metric: str, item: Dict[str, Any]) -> tuple:
-    preferred = 0 if item.get("statement") in PREFERRED_STATEMENTS.get(metric, ()) else 1
+    preferred_statement = 0 if item.get("statement") in PREFERRED_STATEMENTS.get(metric, ()) else 1
     assignment = item.get("assignment")
     assignment_rank = {"title": 0, "continuation": 1, "title_candidate": 2, "raw_text_fallback": 4}.get(assignment, 3)
     validated_rank = 0 if item.get("validated") else 1
-    return (preferred, validated_rank, assignment_rank, -float(item.get("score", 0) or 0), item.get("page") or 10**9)
+    aliases = PREFERRED_ALIASES.get(metric, ())
+    alias_rank = aliases.index(item.get("matched_alias")) if item.get("matched_alias") in aliases else len(aliases)
+    # Exact aggregate rows (e.g. Total net sales) outrank components
+    # (e.g. Products / Services) and generic aliases (e.g. sales / debt).
+    return (
+        preferred_statement,
+        validated_rank,
+        assignment_rank,
+        alias_rank,
+        -float(item.get("score", 0) or 0),
+        item.get("page") or 10**9,
+    )
 
 
 def resolve_metric(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -147,17 +167,18 @@ def resolve_metric(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
             matched = _row_match(row, aliases)
             if not matched:
                 continue
-            values = []
-            for cell in row[1:]:
-                value = _number(cell)
-                if value is not None:
-                    values.append(value)
+            values = [v for v in (_number(cell) for cell in row[1:]) if v is not None]
             if not values:
                 continue
             candidates.append({
-                "metric": metric, "matched_alias": matched, "values": values,
-                "periods": periods, "page": page, "statement": statement_type,
-                "table_title": title, "source": table.get("source"),
+                "metric": metric,
+                "matched_alias": matched,
+                "values": values,
+                "periods": periods,
+                "page": page,
+                "statement": statement_type,
+                "table_title": title,
+                "source": table.get("source"),
                 "score": float(table.get("score", 0) or 0),
                 "validated": bool(table.get("validated")),
                 "assignment": table.get("statement_assignment"),
@@ -186,8 +207,6 @@ def resolve_raw_text(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
             matched = next((a for a in aliases if re.search(rf"(?<!\w){re.escape(_norm(a))}(?!\w)", normalized_line)), None)
             if not matched:
                 continue
-            # First consume numbers on the same line. This handles flattened
-            # financial tables such as: Total net sales 416,161 391,035 383,285.
             tail = re.split(rf"(?<!\w){re.escape(_norm(matched))}(?!\w)", normalized_line, maxsplit=1)[-1]
             values = [_number(t) for t in NUMBER_RE.findall(tail)]
             values = [v for v in values if v is not None]
@@ -346,23 +365,19 @@ def _derived_ebitda_series(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     ebit_candidates = resolve_metric("ebit", data)
     dep_candidates = resolve_metric("depreciation", data)
     if not ebit_candidates or not dep_candidates:
-        # Raw text is a genuine last resort, not a peer to validated tables.
-        ebit_candidates = ebit_candidates or resolve_raw_text("ebit", data)
-        dep_candidates = dep_candidates or resolve_raw_text("depreciation", data)
-    if not ebit_candidates or not dep_candidates:
+        ebit_candidates = ebit_candidates or (resolve_raw_text("ebit", data) if not ebit_candidates else [])
+        dep_candidates = dep_candidates or (resolve_raw_text("depreciation", data) if not dep_candidates else [])
+    ebit_series = _series_from_candidates(ebit_candidates)
+    dep_series = _series_from_candidates(dep_candidates)
+    if not ebit_series or not dep_series:
         return None
-
-    ebit = _series_from_candidates(ebit_candidates)
-    dep = _series_from_candidates(dep_candidates)
-    if not ebit or not dep:
-        return None
-    e_periods, e_values, e_source = ebit
-    d_periods, d_values, d_source = dep
-    common = [(p, e_values[i], d_values[d_periods.index(p)]) for i, p in enumerate(e_periods) if p in d_periods]
+    e_periods, e_values, e_source = ebit_series
+    d_periods, d_values, d_source = dep_series
+    common = [(p, e_values[i], d_values[j]) for i, p in enumerate(e_periods) for j, dp in enumerate(d_periods) if p == dp]
     if len(common) < 2:
         return None
-    periods = [x[0] for x in common]
-    values = [round(x[1] + x[2], 2) for x in common]
+    periods = [p for p, _, _ in common]
+    values = [round(ev + dv, 2) for _, ev, dv in common]
     return {
         "periods": periods,
         "values": values,
@@ -372,84 +387,48 @@ def _derived_ebitda_series(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _two_metric_ebitda(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    series = _derived_ebitda_series(data)
-    if not series or len(series["values"]) < 1:
-        return None
-    value = series["values"][0]
-    period = series["periods"][0] if series["periods"] else None
-    source = series["source"]
-    inputs: List[Dict[str, Any]] = []
-    if isinstance(source, dict) and source.get("items"):
-        for item in source["items"]:
-            inputs.append({"name": item.get("metric", "input"), "value": (item.get("values") or [None])[0], "page": item.get("page")})
-    elif isinstance(source, dict):
-        inputs = [{"name": "EBITDA", "value": value, "page": source.get("page")}]
-    return {
-        "metric": "ebitda", "status": series.get("status", "derived"), "answer": round(value, 2),
-        "period": period, "formula": series.get("formula"), "inputs": inputs,
-        "source": source, "confidence": "high" if series.get("status") == "reported" else "medium",
-    }
-
-
-def _three_metric_ebitda(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    pbt = resolve_metric("pbt", data) or resolve_raw_text("pbt", data)
-    finance = resolve_metric("finance_costs", data) or resolve_raw_text("finance_costs", data)
-    dep = resolve_metric("depreciation", data) or resolve_raw_text("depreciation", data)
-    if not pbt or not finance or not dep:
-        return None
-    p = _select_latest(pbt[0]); f = _select_latest(finance[0]); d = _select_latest(dep[0])
-    if not p or not f or not d or not _same_period(p[1], f[1], d[1]):
-        return None
-    pv, pp = p; fv, fp = f; dv, dp = d
-    return {
-        "metric": "ebitda", "status": "derived", "answer": round(pv + fv + dv, 2),
-        "period": pp or fp or dp, "formula": "PBT + finance costs + depreciation & amortisation",
-        "inputs": [
-            {"name": "PBT", "value": pv, "page": pbt[0].get("page")},
-            {"name": "Finance costs", "value": fv, "page": finance[0].get("page")},
-            {"name": "Depreciation & amortisation", "value": dv, "page": dep[0].get("page")},
-        ], "source": {"items": [pbt[0], finance[0], dep[0]]}, "confidence": "medium",
-    }
-
-
 def compute_ebitda(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    explicit = resolve_metric("ebitda", data)
-    if explicit:
-        latest = _select_latest(explicit[0])
-        if latest:
-            value, period = latest
-            return {"metric": "ebitda", "status": "reported", "answer": round(value, 2), "period": period, "formula": None, "inputs": [], "source": explicit[0], "confidence": "high"}
-    return _two_metric_ebitda(data) or _three_metric_ebitda(data)
-
-
-def _series_change(question: str, periods: List[str], values: List[float], source: Any, metric: str) -> Optional[Dict[str, Any]]:
-    if len(values) < 2 or not periods:
+    series = _derived_ebitda_series(data)
+    if not series:
         return None
-    latest = float(values[0])
-    prior = float(values[1])
+    return {
+        "metric": "ebitda",
+        "status": series.get("status", "derived"),
+        "answer": series["values"][0],
+        "period": series["periods"][0] if series.get("periods") else None,
+        "formula": series.get("formula"),
+        "inputs": [],
+        "source": series.get("source"),
+        "confidence": "high" if series.get("formula") else "medium",
+        "series": {"periods": series.get("periods", []), "values": series.get("values", [])},
+    }
+
+
+def compute_ebitda_change(question: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    series = _derived_ebitda_series(data)
+    if not series or len(series.get("values", [])) < 2:
+        return None
+    values = series["values"]
+    periods = series["periods"]
+    latest, prior = float(values[0]), float(values[1])
     if prior == 0:
         return None
     delta = latest - prior
-    pct = delta / prior * 100.0
-    is_pct = question_intent(question) == "yoy_percent"
+    pct = (delta / prior) * 100.0
+    answer = round(pct, 2) if question_intent(question) == "yoy_percent" else round(delta, 2)
     return {
-        "metric": metric,
+        "metric": "ebitda",
         "status": "derived",
-        "answer": round(pct if is_pct else delta, 2),
-        "latest_value": latest,
-        "prior_value": prior,
-        "change": round(delta, 2),
-        "percent_change": round(pct, 2),
-        "latest_period": periods[0] if periods else None,
-        "prior_period": periods[1] if len(periods) > 1 else None,
-        "period": f"{periods[0]} vs {periods[1]}" if len(periods) > 1 else periods[0],
-        "formula": "(latest − prior) / prior × 100" if is_pct else "latest − prior",
-        "source": source,
+        "answer": answer,
+        "period": f"{periods[0]} vs {periods[1]}",
+        "formula": "(latest − prior) / prior × 100" if question_intent(question) == "yoy_percent" else "latest − prior",
         "inputs": [
-            {"name": periods[0] if periods else "Latest period", "value": latest, "page": None},
-            {"name": periods[1] if len(periods) > 1 else "Prior period", "value": prior, "page": None},
+            {"name": periods[0], "value": latest, "page": None},
+            {"name": periods[1], "value": prior, "page": None},
         ],
+        "source": series.get("source"),
+        "confidence": "high",
+        "series": {"periods": periods, "values": values},
     }
 
 
@@ -462,16 +441,14 @@ def compute_arithmetic(question: str, data: Dict[str, Any]) -> Optional[Dict[str
         return None
     selected = []
     for metric in metrics[:2]:
-        if metric == "ebitda":
+        candidates = resolve_metric(metric, data)
+        if not candidates and metric == "ebitda":
             derived = compute_ebitda(data)
             if derived:
-                items = (derived.get("source") or {}).get("items") or [] if isinstance(derived.get("source"), dict) else []
+                items = (derived.get("source") or {}).get("items") or []
                 page = items[0].get("page") if items else None
                 selected.append((metric, float(derived["answer"]), derived.get("period"), {"page": page, "source": "derived"}))
                 continue
-        candidates = resolve_metric(metric, data)
-        if not candidates:
-            candidates = resolve_raw_text(metric, data)
         if not candidates:
             return None
         latest = _select_latest(candidates[0])
@@ -525,39 +502,40 @@ def compute_enterprise_value(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
 def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     metric = metric_from_question(question)
     candidates = resolve_metric(metric, data) if metric else []
-    raw_evidence = []
-    if metric:
-        raw_evidence = resolve_raw_text(metric, data)[:3]
+    raw_evidence = [] if candidates else (resolve_raw_text(metric, data)[:5] if metric else [])
     related: Dict[str, Any] = {}
+
     if metric == "ebitda":
-        related["ebit"] = resolve_metric("ebit", data)[:3] or resolve_raw_text("ebit", data)[:3]
-        related["depreciation"] = resolve_metric("depreciation", data)[:3] or resolve_raw_text("depreciation", data)[:3]
-        related["pbt"] = resolve_metric("pbt", data)[:3] or resolve_raw_text("pbt", data)[:3]
-        related["finance_costs"] = resolve_metric("finance_costs", data)[:3] or resolve_raw_text("finance_costs", data)[:3]
+        related["ebit"] = resolve_metric("ebit", data)[:3] or (resolve_raw_text("ebit", data)[:3] if not resolve_metric("ebit", data) else [])
+        related["depreciation"] = resolve_metric("depreciation", data)[:3] or (resolve_raw_text("depreciation", data)[:3] if not resolve_metric("depreciation", data) else [])
+        related["pbt"] = resolve_metric("pbt", data)[:3] or (resolve_raw_text("pbt", data)[:3] if not resolve_metric("pbt", data) else [])
+        related["finance_costs"] = resolve_metric("finance_costs", data)[:3] or (resolve_raw_text("finance_costs", data)[:3] if not resolve_metric("finance_costs", data) else [])
 
     computed = None
     intent = question_intent(question)
     if metric == "enterprise_value":
         computed = compute_enterprise_value(data)
-    elif metric == "ebitda":
-        if intent == "value":
-            computed = compute_ebitda(data)
-        else:
-            series = _derived_ebitda_series(data)
-            if series:
-                computed = _series_change(question, series["periods"], series["values"], series.get("source"), "ebitda")
+    elif metric == "ebitda" and intent in {"yoy_percent", "yoy_change"}:
+        computed = compute_ebitda_change(question, data)
+    elif metric == "ebitda" and intent == "value":
+        computed = compute_ebitda(data)
     elif metric and intent in {"yoy_percent", "yoy_change"}:
-        computed = compute_change(question, candidates or raw_evidence)
-    elif metric and intent in {"sum", "difference"}:
-        computed = compute_arithmetic(question, data)
-
-    if computed is None and intent in {"sum", "difference"}:
+        computed = compute_change(question, candidates)
+    elif intent in {"sum", "difference"}:
         computed = compute_arithmetic(question, data)
 
     return {
-        "question": question, "metric": metric, "intent": intent,
-        "document": {"source_name": data.get("summary", {}).get("source_name"), "metadata": data.get("summary", {}).get("metadata", {})},
-        "candidates": candidates[:5], "raw_evidence": raw_evidence, "related": related, "computed": computed,
+        "question": question,
+        "metric": metric,
+        "intent": intent,
+        "document": {
+            "source_name": data.get("summary", {}).get("source_name"),
+            "metadata": data.get("summary", {}).get("metadata", {}),
+        },
+        "candidates": candidates[:5],
+        "raw_evidence": raw_evidence,
+        "related": related,
+        "computed": computed,
     }
 
 
