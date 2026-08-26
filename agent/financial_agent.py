@@ -7,16 +7,20 @@ from extractor.financial_resolver import build_evidence, evidence_sources
 from extractor.financial_schema import FinancialAnswer
 from .ollama_client import chat_json
 
+LLM_MODEL = "qwen3:8b"
+
 SYSTEM_PROMPT = """You are a financial analyst answering questions about one company using supplied evidence.
 Rules:
 1. Use only the supplied evidence. Never invent a number.
 2. Prefer a directly reported line item over a derived value when it exists.
-3. If the resolver supplies a deterministic calculation under `computed`, you MUST use that result and must not recalculate it differently.
-4. If the requested metric is absent from the evidence, return status=not_available and answer=null.
-5. If the evidence conflicts or the period cannot be identified, return status=ambiguous.
-6. A derived metric must show the formula and its input values.
-7. Preserve the document's currency and unit.
-8. Return JSON only with this shape:
+3. If the resolver supplies a deterministic calculation under `computed`, it is authoritative. Do not recalculate it differently.
+4. For enterprise value, never use book equity as market value. Use an explicit EV or market capitalization + debt - cash only when supplied.
+5. For EBITDA, use an explicit reported EBITDA when available; otherwise use the supplied deterministic derivation and label it derived.
+6. If the requested metric is absent from the evidence, return status=not_available and answer=null.
+7. If the evidence conflicts or the period cannot be identified, return status=ambiguous.
+8. A derived metric must show the formula and its input values.
+9. Preserve the document's currency and unit.
+10. Return JSON only with this shape:
 {
   "metric": string,
   "answer": number|string|null,
@@ -52,19 +56,6 @@ def _select_reported_candidate(question: str, evidence: Dict[str, Any]) -> Optio
             continue
         return values[0], periods[0] if periods else None, candidate
     return None
-
-
-def _select_value(question: str, candidate: Dict[str, Any]) -> Tuple[Optional[float | str], Optional[str]]:
-    requested = _requested_year(question)
-    values = candidate.get("values") or []
-    periods = candidate.get("periods") or []
-    if not values:
-        return None, None
-    if requested:
-        for idx, period in enumerate(periods):
-            if requested in period and idx < len(values):
-                return values[idx], period
-    return values[0], periods[0] if periods else None
 
 
 def _source_truth(question: str, evidence: Dict[str, Any]) -> Optional[FinancialAnswer]:
@@ -106,13 +97,8 @@ def _validate(payload: Dict[str, Any], evidence: Dict[str, Any]) -> FinancialAns
         raise RuntimeError("A not_available answer must have a null value.")
     return FinancialAnswer(
         metric=evidence.get("metric") or payload["metric"],
-        answer=payload["answer"],
-        period=payload["period"],
-        currency=payload["currency"],
-        unit=payload["unit"],
-        status=payload["status"],
-        confidence=payload["confidence"],
-        formula=payload["formula"],
+        answer=payload["answer"], period=payload["period"], currency=payload["currency"], unit=payload["unit"],
+        status=payload["status"], confidence=payload["confidence"], formula=payload["formula"],
         inputs=payload["inputs"] or [],
         sources=evidence_sources(evidence.get("candidates", []), evidence.get("raw_evidence", [])),
         explanation=payload["explanation"],
@@ -125,51 +111,40 @@ def _ground_with_computed(answer: FinancialAnswer, evidence: Dict[str, Any]) -> 
         return answer
     metadata = evidence.get("document", {}).get("metadata", {}) or {}
     source = computed.get("source") or {}
+    items = source.get("items") if isinstance(source, dict) else None
+    source_candidates = items if isinstance(items, list) else [source]
     return FinancialAnswer(
         metric=computed.get("metric") or answer.metric,
         answer=computed.get("answer"),
         period=computed.get("period"),
         currency=metadata.get("currency"),
         unit=metadata.get("unit") or metadata.get("currency_unit"),
-        status="derived",
-        confidence="high",
-        formula=computed.get("formula"),
-        inputs=computed.get("inputs") or [],
-        sources=evidence_sources([source], evidence.get("raw_evidence", [])),
-        explanation=answer.explanation or (
-            f"Calculated from {computed.get('latest_period') or 'latest'} and "
-            f"{computed.get('prior_period') or 'prior'} values in the source evidence."
-        ),
+        status=computed.get("status", "derived"),
+        confidence=computed.get("confidence", "high") if computed.get("status") != "reported" else "high",
+        formula=computed.get("formula"), inputs=computed.get("inputs") or [],
+        sources=evidence_sources(source_candidates, evidence.get("raw_evidence", [])),
+        explanation=answer.explanation or "The value was source-verified and calculated by the deterministic financial resolver.",
     )
 
 
 def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     evidence = build_evidence(question, data)
     if not evidence.get("metric"):
-        return {
-            "metric": None,
-            "answer": None,
-            "status": "ambiguous",
-            "confidence": "low",
-            "message": "I could not map that question to a supported financial metric yet.",
-            "llm_used": False,
-            "evidence": evidence,
-        }
+        return {"metric": None, "answer": None, "status": "ambiguous", "confidence": "low", "message": "I could not map that question to a supported financial metric yet.", "llm_used": False, "evidence": evidence}
 
     source_truth = _source_truth(question, evidence)
     user_prompt = (
         "Answer the question using ONLY this evidence.\n\n"
-        "If `computed` is present, it is authoritative for the requested arithmetic. "
-        "Use it exactly and explain it briefly.\n\n"
-        f"{evidence}\n\n"
-        f"Question: {question}"
+        "If `computed` is present, it is authoritative for the requested financial arithmetic or derivation. "
+        "Use it exactly and explain it briefly. Do not substitute another formula.\n\n"
+        f"{evidence}\n\nQuestion: {question}"
     )
     payload = chat_json(SYSTEM_PROMPT, user_prompt)
     answer = _validate(payload, evidence)
     answer = _ground_with_computed(answer, evidence)
     if not evidence.get("computed"):
         answer = _ground_with_source_truth(answer, source_truth)
-    return {**answer.as_dict(), "llm_used": True, "llm_model": "qwen3:4b", "evidence": evidence}
+    return {**answer.as_dict(), "llm_used": True, "llm_model": LLM_MODEL, "evidence": evidence}
 
 
 def _ground_with_source_truth(llm_answer: FinancialAnswer, source_truth: Optional[FinancialAnswer]) -> FinancialAnswer:
@@ -177,16 +152,9 @@ def _ground_with_source_truth(llm_answer: FinancialAnswer, source_truth: Optiona
         return llm_answer
     if llm_answer.status in {"reported", "not_available"} or llm_answer.answer != source_truth.answer:
         return FinancialAnswer(
-            metric=source_truth.metric,
-            answer=source_truth.answer,
-            period=source_truth.period,
-            currency=source_truth.currency,
-            unit=source_truth.unit,
-            status="reported",
-            confidence="high",
-            formula=None,
-            inputs=llm_answer.inputs,
-            sources=source_truth.sources,
+            metric=source_truth.metric, answer=source_truth.answer, period=source_truth.period,
+            currency=source_truth.currency, unit=source_truth.unit, status="reported", confidence="high",
+            formula=None, inputs=llm_answer.inputs, sources=source_truth.sources,
             explanation=llm_answer.explanation or source_truth.explanation,
         )
     return llm_answer
