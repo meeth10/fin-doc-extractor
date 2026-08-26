@@ -223,6 +223,11 @@ def _select_latest(candidate: Dict[str, Any]) -> Optional[Tuple[float, Optional[
     return float(values[0]), periods[0] if periods else None
 
 
+def _same_period(*periods: Optional[str]) -> bool:
+    known = {p for p in periods if p}
+    return len(known) <= 1
+
+
 def compute_change(question: str, candidates: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     candidate = _pick_candidate(question, candidates)
     if not candidate:
@@ -237,26 +242,19 @@ def compute_change(question: str, candidates: List[Dict[str, Any]]) -> Optional[
     pct = (delta / prior) * 100.0
     latest_period = periods[0] if len(periods) > 0 else None
     prior_period = periods[1] if len(periods) > 1 else None
-    intent = question_intent(question)
-    if intent == "yoy_percent":
-        answer: float | str = round(pct, 2)
+    if question_intent(question) == "yoy_percent":
+        answer = round(pct, 2)
         formula = "(latest − prior) / prior × 100"
     else:
         answer = round(delta, 2)
         formula = "latest − prior"
     return {
-        "metric": candidate.get("metric"),
-        "status": "derived",
-        "answer": answer,
-        "latest_value": latest,
-        "prior_value": prior,
-        "change": round(delta, 2),
-        "percent_change": round(pct, 2),
-        "latest_period": latest_period,
+        "metric": candidate.get("metric"), "status": "derived", "answer": answer,
+        "latest_value": latest, "prior_value": prior, "change": round(delta, 2),
+        "percent_change": round(pct, 2), "latest_period": latest_period,
         "prior_period": prior_period,
         "period": f"{latest_period} vs {prior_period}" if latest_period and prior_period else None,
-        "formula": formula,
-        "source": candidate,
+        "formula": formula, "source": candidate,
         "inputs": [
             {"name": latest_period or "Latest period", "value": latest, "page": candidate.get("page")},
             {"name": prior_period or "Prior period", "value": prior, "page": candidate.get("page")},
@@ -282,35 +280,27 @@ def compute_arithmetic(question: str, data: Dict[str, Any]) -> Optional[Dict[str
         value, period = latest
         selected.append((metric, value, period, candidates[0]))
     (m1, v1, p1, c1), (m2, v2, p2, c2) = selected
-    if p1 and p2 and p1 != p2:
+    if not _same_period(p1, p2):
         return None
     answer = v1 + v2 if intent == "sum" else v1 - v2
     formula = f"{m1} + {m2}" if intent == "sum" else f"{m1} − {m2}"
     return {
-        "metric": f"{m1}_{'plus' if intent == 'sum' else 'minus'}_{m2}",
-        "status": "derived",
-        "answer": round(answer, 2),
-        "period": p1 or p2,
-        "formula": formula,
+        "metric": f"{m1}_{'plus' if intent == 'sum' else 'minus'}_{m2}", "status": "derived",
+        "answer": round(answer, 2), "period": p1 or p2, "formula": formula,
         "inputs": [
             {"name": m1, "value": v1, "page": c1.get("page")},
             {"name": m2, "value": v2, "page": c2.get("page")},
-        ],
-        "source": {"items": [c1, c2]},
+        ], "source": {"items": [c1, c2]},
     }
 
 
-def compute_enterprise_value(question: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def compute_enterprise_value(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     explicit = resolve_metric("enterprise_value", data) or resolve_raw_text("enterprise_value", data)
     if explicit:
         latest = _select_latest(explicit[0])
         if latest:
             value, period = latest
-            return {
-                "metric": "enterprise_value", "status": "reported", "answer": round(value, 2),
-                "period": period, "formula": None,
-                "inputs": [], "source": explicit[0],
-            }
+            return {"metric": "enterprise_value", "status": "reported", "answer": round(value, 2), "period": period, "formula": None, "inputs": [], "source": explicit[0]}
 
     market = resolve_metric("market_capitalization", data) or resolve_raw_text("market_capitalization", data)
     debt = resolve_metric("total_debt", data) or resolve_raw_text("total_debt", data)
@@ -318,11 +308,9 @@ def compute_enterprise_value(question: str, data: Dict[str, Any]) -> Optional[Di
     if not market or not debt or not cash:
         return None
     m = _select_latest(market[0]); d = _select_latest(debt[0]); c = _select_latest(cash[0])
-    if not m or not d or not c:
+    if not m or not d or not c or not _same_period(m[1], d[1], c[1]):
         return None
     mv, mp = m; dv, dp = d; cv, cp = c
-    if len({p for p in (mp, dp, cp) if p}) > 1:
-        return None
     return {
         "metric": "enterprise_value", "status": "derived", "answer": round(mv + dv - cv, 2),
         "period": mp or dp or cp, "formula": "market capitalization + total debt − cash",
@@ -330,9 +318,58 @@ def compute_enterprise_value(question: str, data: Dict[str, Any]) -> Optional[Di
             {"name": "Market capitalization", "value": mv, "page": market[0].get("page")},
             {"name": "Total debt", "value": dv, "page": debt[0].get("page")},
             {"name": "Cash & equivalents", "value": cv, "page": cash[0].get("page")},
-        ],
-        "source": {"items": [market[0], debt[0], cash[0]]},
+        ], "source": {"items": [market[0], debt[0], cash[0]]},
     }
+
+
+def _two_metric_ebitda(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    ebit = resolve_metric("ebit", data) or resolve_raw_text("ebit", data)
+    dep = resolve_metric("depreciation", data) or resolve_raw_text("depreciation", data)
+    if not ebit or not dep:
+        return None
+    e = _select_latest(ebit[0]); d = _select_latest(dep[0])
+    if not e or not d or not _same_period(e[1], d[1]):
+        return None
+    ev, ep = e; dv, dp = d
+    return {
+        "metric": "ebitda", "status": "derived", "answer": round(ev + dv, 2),
+        "period": ep or dp, "formula": "EBIT + depreciation & amortisation",
+        "inputs": [
+            {"name": "EBIT", "value": ev, "page": ebit[0].get("page")},
+            {"name": "Depreciation & amortisation", "value": dv, "page": dep[0].get("page")},
+        ], "source": {"items": [ebit[0], dep[0]]}, "confidence": "high",
+    }
+
+
+def _three_metric_ebitda(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    pbt = resolve_metric("pbt", data) or resolve_raw_text("pbt", data)
+    finance = resolve_metric("finance_costs", data) or resolve_raw_text("finance_costs", data)
+    dep = resolve_metric("depreciation", data) or resolve_raw_text("depreciation", data)
+    if not pbt or not finance or not dep:
+        return None
+    p = _select_latest(pbt[0]); f = _select_latest(finance[0]); d = _select_latest(dep[0])
+    if not p or not f or not d or not _same_period(p[1], f[1], d[1]):
+        return None
+    pv, pp = p; fv, fp = f; dv, dp = d
+    return {
+        "metric": "ebitda", "status": "derived", "answer": round(pv + fv + dv, 2),
+        "period": pp or fp or dp, "formula": "PBT + finance costs + depreciation & amortisation",
+        "inputs": [
+            {"name": "PBT", "value": pv, "page": pbt[0].get("page")},
+            {"name": "Finance costs", "value": fv, "page": finance[0].get("page")},
+            {"name": "Depreciation & amortisation", "value": dv, "page": dep[0].get("page")},
+        ], "source": {"items": [pbt[0], finance[0], dep[0]]}, "confidence": "medium",
+    }
+
+
+def compute_ebitda(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    explicit = resolve_metric("ebitda", data) or resolve_raw_text("ebitda", data)
+    if explicit:
+        latest = _select_latest(explicit[0])
+        if latest:
+            value, period = latest
+            return {"metric": "ebitda", "status": "reported", "answer": round(value, 2), "period": period, "formula": None, "inputs": [], "source": explicit[0], "confidence": "high"}
+    return _two_metric_ebitda(data) or _three_metric_ebitda(data)
 
 
 def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
@@ -340,7 +377,6 @@ def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
     candidates = resolve_metric(metric, data) if metric else []
     raw_evidence = resolve_raw_text(metric, data)[:5] if metric else []
     related: Dict[str, Any] = {}
-
     if metric == "ebitda":
         related["ebit"] = resolve_metric("ebit", data)[:3] or resolve_raw_text("ebit", data)[:3]
         related["depreciation"] = resolve_metric("depreciation", data)[:3] or resolve_raw_text("depreciation", data)[:3]
@@ -349,24 +385,21 @@ def build_evidence(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
 
     computed = None
     if metric == "enterprise_value":
-        computed = compute_enterprise_value(question, data)
+        computed = compute_enterprise_value(data)
+    elif metric == "ebitda" and question_intent(question) == "value":
+        computed = compute_ebitda(data)
     elif metric and question_intent(question) in {"yoy_percent", "yoy_change"}:
         computed = compute_change(question, candidates)
-    else:
+    elif metric:
+        computed = compute_arithmetic(question, data)
+
+    if computed is None and question_intent(question) in {"sum", "difference"}:
         computed = compute_arithmetic(question, data)
 
     return {
-        "question": question,
-        "metric": metric,
-        "intent": question_intent(question),
-        "document": {
-            "source_name": data.get("summary", {}).get("source_name"),
-            "metadata": data.get("summary", {}).get("metadata", {}),
-        },
-        "candidates": candidates[:5],
-        "raw_evidence": raw_evidence,
-        "related": related,
-        "computed": computed,
+        "question": question, "metric": metric, "intent": question_intent(question),
+        "document": {"source_name": data.get("summary", {}).get("source_name"), "metadata": data.get("summary", {}).get("metadata", {})},
+        "candidates": candidates[:5], "raw_evidence": raw_evidence, "related": related, "computed": computed,
     }
 
 
