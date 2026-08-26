@@ -367,7 +367,27 @@ def compute_ebitda_change(question: str, data: Dict[str, Any]) -> Optional[Dict[
     delta = latest - prior
     pct = delta / prior * 100.0
     is_pct = question_intent(question) == "yoy_percent"
-    return {"metric": "ebitda", "status": "derived", "answer": round(pct if is_pct else delta, 2), "period": f"{series['periods'][0]} vs {series['periods'][1]}", "formula": "(latest − prior) / prior × 100" if is_pct else "latest − prior", "inputs": [{"name": series["periods"][0], "value": latest, "page": None}, {"name": series["periods"][1], "value": prior, "page": None}], "source": series.get("source"), "confidence": "high", "series": {"periods": series["periods"], "values": series["values"]}}
+    periods = series["periods"]
+    return {
+        "metric": "ebitda",
+        "status": "derived",
+        "answer": round(pct if is_pct else delta, 2),
+        "latest_value": latest,
+        "prior_value": prior,
+        "change": round(delta, 2),
+        "percent_change": round(pct, 2),
+        "latest_period": periods[0],
+        "prior_period": periods[1],
+        "period": f"{periods[0]} vs {periods[1]}",
+        "formula": "(latest − prior) / prior × 100" if is_pct else "latest − prior",
+        "inputs": [
+            {"name": periods[0], "value": latest, "page": None},
+            {"name": periods[1], "value": prior, "page": None},
+        ],
+        "source": series.get("source"),
+        "confidence": "high",
+        "series": {"periods": periods, "values": series["values"]},
+    }
 
 
 def compute_arithmetic(question: str, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
