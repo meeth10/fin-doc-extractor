@@ -12,6 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from extractor.pipeline import extract
+from extractor.financial_facts import build_fact_store
 from agent.financial_agent import answer_question
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -47,10 +48,7 @@ def _write_status(run_dir: Path, **payload) -> None:
 
 
 def _page_scores(result: dict) -> dict[int, dict]:
-    return {
-        int(item["page_number_human"]) - 1: item
-        for item in result.get("_debug", {}).get("page_scores", [])
-    }
+    return {int(item["page_number_human"]) - 1: item for item in result.get("_debug", {}).get("page_scores", [])}
 
 
 def _table_statement_type(table: dict, page_scores: dict[int, dict]) -> tuple[str | None, str]:
@@ -73,10 +71,7 @@ def _table_statement_type(table: dict, page_scores: dict[int, dict]) -> tuple[st
 
 def _build_statement_tables(result: dict, tables: dict) -> dict:
     page_scores = _page_scores(result)
-    grouped = {
-        key: {"label": STATEMENT_LABELS[key], "tables": [], "pages": [], "status": "empty"}
-        for key in STATEMENT_TYPES
-    }
+    grouped = {key: {"label": STATEMENT_LABELS[key], "tables": [], "pages": [], "status": "empty"} for key in STATEMENT_TYPES}
     for table in tables.get("tables", []):
         statement_type, assignment = _table_statement_type(table, page_scores)
         enriched = dict(table)
@@ -101,7 +96,7 @@ def _run_extraction(run_id: str, source_name: str) -> None:
     try:
         _write_status(run_dir, status="running", progress=5, message="Reading PDF and extracting evidence", source_name=source_name)
         result = extract(str(pdf_path), out_dir=str(run_dir), debug=True, render_images=True)
-        _write_status(run_dir, status="running", progress=90, message="Preparing statement outputs", source_name=source_name)
+        _write_status(run_dir, status="running", progress=90, message="Preparing statement and fact outputs", source_name=source_name)
 
         document = json.loads(Path(result["artifacts"]["document_json"]).read_text(encoding="utf-8"))
         tables = json.loads(Path(result["artifacts"]["tables_json"]).read_text(encoding="utf-8"))
@@ -113,14 +108,23 @@ def _run_extraction(run_id: str, source_name: str) -> None:
         statement_tables = result.get("statement_tables") or _build_statement_tables(result, tables)
         statement_counts = {key: len(bucket.get("tables", [])) for key, bucket in statement_tables.items()}
 
+        fact_input = {
+            "summary": {"source_name": source_name, "metadata": result["document_metadata"]},
+            "document": document,
+            "statement_tables": statement_tables,
+        }
+        fact_store = build_fact_store(fact_input)
+        (run_dir / "financial_facts.json").write_text(json.dumps(fact_store, indent=2, ensure_ascii=False), encoding="utf-8")
+
         for key in STATEMENT_TYPES:
             payload = {"schema_version": "1.0", "statement_type": key, "statement_label": STATEMENT_LABELS[key], "source_file": source_name, "status": statement_tables[key]["status"], "pages": statement_tables[key]["pages"], "tables": statement_tables[key]["tables"]}
             (run_dir / f"{key}.json").write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
         payload = {
             "run_id": run_id,
-            "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "statement_counts": statement_counts, "elapsed_seconds": result["elapsed_seconds"]},
+            "summary": {"source_name": source_name, "total_pages": result["total_pages"], "metadata": result["document_metadata"], "sections": result["sections_found"], "table_summary": result["table_summary"], "statement_counts": statement_counts, "fact_count": fact_store["fact_count"], "elapsed_seconds": result["elapsed_seconds"]},
             "statement_tables": statement_tables,
+            "financial_facts": fact_store,
             "document": document,
             "tables": tables,
             "visuals": visuals,
@@ -155,14 +159,12 @@ def ask_financials(request: AskRequest):
     question = request.question.strip()
     if not question:
         raise HTTPException(status_code=400, detail="Question cannot be empty.")
-
     run_dir = RUNS / request.run_id if request.run_id else None
     if run_dir is None or not (run_dir / "result.json").exists():
         candidates = [p for p in RUNS.iterdir() if p.is_dir() and (p / "result.json").exists()]
         if not candidates:
             raise HTTPException(status_code=404, detail="No completed document is available. Upload a PDF first.")
         run_dir = max(candidates, key=lambda p: (p / "result.json").stat().st_mtime)
-
     try:
         data = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
         result = answer_question(question, data)
