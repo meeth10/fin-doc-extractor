@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from extractor.pipeline import extract
 from extractor.financial_facts import build_fact_store
+from extractor.trusted_financials import trusted_answer
 from agent.financial_agent import answer_question
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -187,6 +188,20 @@ def ask_financials(request: AskRequest):
     try:
         data = json.loads((run_dir / "result.json").read_text(encoding="utf-8"))
         result = answer_question(question, data)
+        trusted = trusted_answer(question, data)
+        if trusted:
+            result.update({
+                "metric": trusted["metric"],
+                "answer": trusted["answer"],
+                "period": trusted["period"],
+                "status": trusted["status"],
+                "confidence": trusted["confidence"],
+                "formula": trusted["formula"],
+                "inputs": trusted["inputs"],
+                "source_page": trusted["source_page"],
+                "explanation": trusted["explanation"],
+                "trusted_numeric_grounding": True,
+            })
         result["run_id"] = run_dir.name
         return result
     except RuntimeError as exc:
