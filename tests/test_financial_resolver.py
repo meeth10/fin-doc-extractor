@@ -13,6 +13,32 @@ def sample_data():
     }
 
 
+def apple_style_data():
+    data = sample_data()
+    data["statement_tables"]["income_statement"]["tables"][0]["table"] = [
+        ["Particulars", "September 27, 2025", "September 28, 2024", "September 30, 2023"],
+        ["Products", "307,003", "294,866", "298,085"],
+        ["Services", "109,158", "96,169", "85,200"],
+        ["Total net sales", "416,161", "391,035", "383,285"],
+        ["Operating income", "133,050", "123,216", "114,301"],
+        ["Net income", "112,010", "93,736", "96,995"],
+    ]
+    data["statement_tables"]["cash_flow"]["tables"] = [{
+        "page_number": 90,
+        "page_number_human": 91,
+        "table_title": "Consolidated Statements of Cash Flows",
+        "source": "pymupdf_layout",
+        "score": 1.0,
+        "validated": True,
+        "statement_assignment": "title",
+        "table": [
+            ["Particulars", "September 27, 2025", "September 28, 2024", "September 30, 2023"],
+            ["Depreciation and amortization", "11,698", "11,519", "11,519"],
+        ],
+    }]
+    return data
+
+
 def test_metric_from_question():
     assert metric_from_question("What was the cash balance?") == "cash_and_equivalents"
     assert metric_from_question("What was EBITDA?") == "ebitda"
@@ -50,3 +76,20 @@ def test_sum_and_difference_are_supported():
     diff = build_evidence("What is the difference between revenue and EBITDA?", sample_data())
     assert add["computed"]["answer"] == 15500.0
     assert diff["computed"]["answer"] == 8500.0
+
+
+def test_total_net_sales_resolves_as_revenue_not_year_number():
+    evidence = build_evidence("What was revenue at FY2025?", apple_style_data())
+    assert evidence["computed"] is None
+    assert evidence["candidates"]
+    assert evidence["candidates"][0]["matched_alias"] == "total net sales"
+    assert evidence["candidates"][0]["values"] == [416161.0, 391035.0, 383285.0]
+    assert evidence["candidates"][0]["page"] == 89
+
+
+def test_ebitda_growth_derives_two_aligned_periods():
+    evidence = build_evidence("What was EBITDA growth?", apple_style_data())
+    assert evidence["computed"] is not None
+    assert evidence["computed"]["latest_value"] == 144748.0
+    assert evidence["computed"]["prior_value"] == 134735.0
+    assert evidence["computed"]["change"] == 10013.0
