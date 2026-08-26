@@ -2,25 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, List
 
-from .financial_resolver import (
-    compute_ebitda,
-    compute_enterprise_value,
-    resolve_metric,
-)
+from .financial_resolver import compute_ebitda, compute_enterprise_value, resolve_metric
 
 CORE_METRICS = (
-    "revenue",
-    "ebit",
-    "ebitda",
-    "pat",
-    "pbt",
-    "cash_and_equivalents",
-    "total_debt",
-    "cfo",
-    "capex",
-    "total_assets",
-    "total_equity",
-    "market_capitalization",
+    "revenue", "ebit", "ebitda", "pat", "pbt", "cash_and_equivalents",
+    "total_debt", "cfo", "capex", "total_assets", "total_equity", "market_capitalization",
 )
 
 
@@ -33,10 +19,9 @@ def _period_value_pairs(candidate: Dict[str, Any]) -> Iterable[tuple[str | None,
 
 
 def _candidate_facts(metric: str, data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # The normalized fact store is deliberately stricter than the evidence
-    # layer. Raw-text matches remain visible to the agent, but they do not
-    # become canonical facts unless they have first been represented as a
-    # validated statement table.
+    # Canonical facts require a validated structured statement table. Raw/OCR
+    # evidence stays available for inspection and model context but cannot
+    # silently become a normalized financial fact.
     candidates = [c for c in resolve_metric(metric, data) if c.get("validated")]
     facts: List[Dict[str, Any]] = []
     for candidate in candidates:
@@ -71,7 +56,6 @@ def _dedupe(facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
     metadata = data.get("summary", {}).get("metadata", {}) or {}
     facts: List[Dict[str, Any]] = []
-
     for metric in CORE_METRICS:
         facts.extend(_candidate_facts(metric, data))
 
@@ -79,7 +63,6 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
     ebitda = compute_ebitda(data)
     if ebitda and ebitda.get("status") == "derived":
         derived.append(ebitda)
-
     enterprise_value = compute_enterprise_value(data)
     if enterprise_value and enterprise_value.get("status") == "derived":
         derived.append(enterprise_value)
@@ -102,7 +85,7 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
 
     facts.sort(key=lambda x: (x.get("metric") or "", str(x.get("period") or ""), x.get("page") or 10**9))
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "document": {
             "source_name": data.get("summary", {}).get("source_name"),
             "currency": metadata.get("currency"),
