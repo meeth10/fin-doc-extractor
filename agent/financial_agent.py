@@ -1,209 +1,172 @@
 from __future__ import annotations
 
-import json
-import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from extractor.financial_resolver import build_evidence, evidence_sources
 from extractor.financial_schema import FinancialAnswer
-from .ollama_client import chat_json
-from .retrieval_agent import retrieve
-
-REASONING_MODEL = "deepseek-r1:8b"
-RETRIEVAL_MODEL = "ibm/granite4.2:3b"
-
-SYSTEM_PROMPT = """You are the senior financial reasoning analyst.
-You receive one question and a compact evidence packet selected by a separate retrieval model.
-
-Rules:
-1. Use only the supplied evidence packet and deterministic computed evidence.
-2. Never invent a number, period, unit, or source.
-3. Prefer directly reported aggregate line items over components.
-4. If `computed` is present, it is authoritative and must be used exactly.
-5. Distinguish reported from derived values.
-6. For derived metrics, show the formula and actual input values.
-7. If evidence is insufficient or conflicts, return ambiguous/not_available rather than guessing.
-8. Keep the explanation concise: 2-5 sentences unless the question asks for analysis.
-9. Return exactly one valid JSON object and nothing else:
-{
-  "metric": string,
-  "answer": number|string|null,
-  "period": string|null,
-  "currency": string|null,
-  "unit": string|null,
-  "status": "reported"|"derived"|"ambiguous"|"not_available",
-  "confidence": "high"|"medium"|"low",
-  "formula": string|null,
-  "inputs": [{"name": string, "value": number|string, "page": number|null}],
-  "explanation": string|null
-}
-"""
+from extractor.financial_resolver import build_evidence, evidence_sources, resolve_metric, resolve_raw_text
+from .financial_facts import build_fact_store, total_debt_candidates
+from .qwen_agents import CRITIC_MODEL, DOCUMENT_MODEL, REASONING_MODEL, analyze, critique
+from .qwen_retrieval import retrieve
 
 
-def _requested_year(question: str) -> Optional[str]:
-    m = re.search(r"\b(?:fy\s*)?(20\d{2}(?:[-/–]\d{2})?)\b", question, re.I)
-    return m.group(1) if m else None
+def _metadata(data: Dict[str, Any]) -> Dict[str, Any]:
+    return data.get("summary", {}).get("metadata", {}) or {}
 
 
-def _select_reported_candidate(question: str, evidence: Dict[str, Any]) -> Optional[Tuple[float | str, Optional[str], Dict[str, Any]]]:
-    requested = _requested_year(question)
-    pools = list(evidence.get("candidates", [])) + list(evidence.get("raw_evidence", []))
-    for candidate in pools:
-        values = candidate.get("values") or []
-        if not values:
-            continue
-        periods = candidate.get("periods") or []
-        if requested:
-            for idx, period in enumerate(periods):
-                if requested in period and idx < len(values):
-                    return values[idx], period, candidate
-            continue
-        return values[0], periods[0] if periods else None, candidate
+def _total_debt(selected_facts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    facts = [f for f in selected_facts if f.get("statement") == "balance_sheet" and f.get("status") == "reported" and not f.get("is_flow_candidate")]
+    if not facts:
+        return None
+    periods = [f.get("period") for f in facts if f.get("period")]
+    period = periods[0] if periods else None
+    if period:
+        facts = [f for f in facts if f.get("period") == period]
+
+    explicit = [f for f in facts if "total debt" in str(f.get("label", "")).lower()]
+    if explicit:
+        f = explicit[0]
+        return {"metric": "total_debt", "status": "reported", "answer": f["value"], "period": period, "formula": None, "inputs": [{"name": f.get("label"), "value": f.get("value"), "page": f.get("page")}], "source": {"items": [f]}, "confidence": "high"}
+
+    components = [f for f in facts if any(token in str(f.get("label", "")).lower() for token in ("commercial paper", "term debt", "borrowings"))]
+    # Keep one row for each distinct reported component.
+    unique = []
+    seen = set()
+    for f in components:
+        key = (str(f.get("label", "")).lower(), f.get("value"), f.get("page"), f.get("period"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(f)
+    commercial = [f for f in unique if "commercial paper" in str(f.get("label", "")).lower()]
+    term = [f for f in unique if "term debt" in str(f.get("label", "")).lower()]
+    if commercial and len(term) >= 2:
+        chosen = commercial + term[:2]
+        return {
+            "metric": "total_debt",
+            "status": "derived",
+            "answer": round(sum(float(f["value"]) for f in chosen), 2),
+            "period": period,
+            "formula": "commercial paper + current term debt + non-current term debt",
+            "inputs": [{"name": f.get("label"), "value": f.get("value"), "page": f.get("page")} for f in chosen],
+            "source": {"items": chosen},
+            "confidence": "high",
+        }
     return None
 
 
-def _source_truth(question: str, evidence: Dict[str, Any]) -> Optional[FinancialAnswer]:
+def _deterministic_computation(question: str, data: Dict[str, Any], selected_facts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    lowered = question.lower()
+    if "total debt" in lowered or lowered.strip() == "debt":
+        result = _total_debt(selected_facts)
+        if result:
+            return result
+
+    evidence = build_evidence(question, data)
+    if evidence.get("computed"):
+        return evidence["computed"]
+
     metric = evidence.get("metric")
-    if not metric:
-        return None
-    selected = _select_reported_candidate(question, evidence)
-    if not selected:
-        return None
-    value, period, source = selected
-    metadata = evidence.get("document", {}).get("metadata", {}) or {}
-    is_raw = source.get("source") == "raw_text"
-    confidence = "medium" if is_raw else ("high" if source.get("validated") else "medium")
+    candidates = resolve_metric(metric, data) if metric else []
+    if not candidates and metric:
+        candidates = resolve_raw_text(metric, data)
+    if candidates and candidates[0].get("values"):
+        c = candidates[0]
+        return {
+            "metric": metric,
+            "status": "reported",
+            "answer": c["values"][0],
+            "period": (c.get("periods") or [None])[0],
+            "formula": None,
+            "inputs": [],
+            "source": c,
+            "confidence": "high" if c.get("validated") else "medium",
+        }
+    return None
+
+
+def _from_computation(computation: Dict[str, Any], data: Dict[str, Any]) -> FinancialAnswer:
+    metadata = _metadata(data)
+    source = computation.get("source") or {}
+    items = source.get("items") or ([source] if source else [])
     return FinancialAnswer(
-        metric=metric,
-        answer=value,
-        period=period,
+        metric=computation.get("metric") or "unknown",
+        answer=computation.get("answer"),
+        period=computation.get("period"),
         currency=metadata.get("currency"),
         unit=metadata.get("unit") or metadata.get("currency_unit"),
-        status="reported",
-        confidence=confidence,
-        formula=None,
-        inputs=[],
-        sources=evidence_sources([source], []),
-        explanation=f"Source-selected under {source.get('table_title') or source.get('matched_alias') or metric}.",
-    )
-
-
-def _validate(payload: Dict[str, Any], evidence: Dict[str, Any]) -> FinancialAnswer:
-    required = {"metric", "answer", "period", "currency", "unit", "status", "confidence", "formula", "inputs", "explanation"}
-    missing = required - set(payload)
-    if missing:
-        raise RuntimeError(f"DeepSeek response missing fields: {sorted(missing)}")
-    if payload["status"] not in {"reported", "derived", "ambiguous", "not_available"}:
-        raise RuntimeError("DeepSeek returned an invalid financial status.")
-    if payload["confidence"] not in {"high", "medium", "low"}:
-        raise RuntimeError("DeepSeek returned an invalid confidence.")
-    if payload["status"] != "not_available" and payload["answer"] is None:
-        raise RuntimeError("Non-available answer cannot have a null value.")
-    if payload["status"] == "not_available" and payload["answer"] is not None:
-        raise RuntimeError("A not_available answer must have a null value.")
-    return FinancialAnswer(
-        metric=evidence.get("metric") or payload["metric"],
-        answer=payload["answer"],
-        period=payload["period"],
-        currency=payload["currency"],
-        unit=payload["unit"],
-        status=payload["status"],
-        confidence=payload["confidence"],
-        formula=payload["formula"],
-        inputs=payload["inputs"] or [],
-        sources=evidence_sources(evidence.get("candidates", []), evidence.get("raw_evidence", [])),
-        explanation=payload["explanation"],
-    )
-
-
-def _ground_with_computed(answer: FinancialAnswer, evidence: Dict[str, Any]) -> FinancialAnswer:
-    computed = evidence.get("computed")
-    if not computed:
-        return answer
-    metadata = evidence.get("document", {}).get("metadata", {}) or {}
-    source = computed.get("source") or {}
-    source_candidates = source.get("items") or ([source] if source else [])
-    return FinancialAnswer(
-        metric=computed.get("metric") or answer.metric,
-        answer=computed.get("answer"),
-        period=computed.get("period"),
-        currency=metadata.get("currency"),
-        unit=metadata.get("unit") or metadata.get("currency_unit"),
-        status=computed.get("status", "derived"),
-        confidence=computed.get("confidence", "high"),
-        formula=computed.get("formula"),
-        inputs=computed.get("inputs") or [],
-        sources=evidence_sources(source_candidates, evidence.get("raw_evidence", [])),
-        explanation=answer.explanation or "Calculated deterministically from source evidence.",
-    )
-
-
-def _ground_with_source_truth(llm_answer: FinancialAnswer, source_truth: Optional[FinancialAnswer]) -> FinancialAnswer:
-    if source_truth is None:
-        return llm_answer
-    return FinancialAnswer(
-        metric=source_truth.metric,
-        answer=source_truth.answer,
-        period=source_truth.period,
-        currency=source_truth.currency,
-        unit=source_truth.unit,
-        status=source_truth.status,
-        confidence=source_truth.confidence,
-        formula=source_truth.formula,
-        inputs=llm_answer.inputs,
-        sources=source_truth.sources,
-        explanation=llm_answer.explanation or source_truth.explanation,
+        status=computation.get("status", "derived"),
+        confidence=computation.get("confidence", "high"),
+        formula=computation.get("formula"),
+        inputs=computation.get("inputs") or [],
+        sources=evidence_sources(items, []),
+        explanation=None,
     )
 
 
 def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
-    evidence = build_evidence(question, data)
-    if not evidence.get("metric"):
+    retrieval = retrieve(question, data)
+    computation = _deterministic_computation(question, data, retrieval.get("selected_facts", []))
+
+    # Factual questions should not pay the cost of a reasoning model. The
+    # deterministic answer plus source provenance is already the authoritative
+    # answer; Qwen is reserved for interpretation-heavy work.
+    if computation is not None and retrieval.get("mode") == "deterministic_fact_first":
+        answer = _from_computation(computation, data)
+        if computation.get("status") == "derived":
+            explanation = "Derived from the reported balance-sheet components: " + "; ".join(
+                f"{i.get('name')}={i.get('value')}" for i in computation.get("inputs", [])
+            ) + "."
+        else:
+            explanation = "Reported from the cited financial statement."
+        answer.explanation = explanation
         return {
-            "metric": None,
-            "answer": None,
-            "status": "ambiguous",
-            "confidence": "low",
-            "message": "I could not map that question to a supported financial metric yet.",
+            **answer.as_dict(),
             "llm_used": False,
-            "evidence": evidence,
+            "models": {
+                "embedding": retrieval.get("embedding_model"),
+                "document": DOCUMENT_MODEL,
+                "reasoning": REASONING_MODEL,
+                "critic": CRITIC_MODEL,
+            },
+            "retrieval": retrieval,
+            "deterministic_computation": computation,
         }
 
-    retrieval_packet = retrieve(question, evidence)
-    reasoning_input = {
-        "question": question,
-        "computed": evidence.get("computed"),
-        "document": evidence.get("document"),
-        "selected_sources": retrieval_packet.get("selected_sources", []),
-        "retrieval_warnings": retrieval_packet.get("warnings", []),
-    }
-    user_prompt = (
-        "Reason through the question using ONLY this compact evidence packet. "
-        "Do not use prior knowledge or unsupported facts. "
-        "If `computed` is present, it is authoritative and must be used exactly.\n\n"
-        f"{json.dumps(reasoning_input, ensure_ascii=False)}\n\n"
-        f"Question: {question}"
-    )
-    payload = chat_json(
-        SYSTEM_PROMPT,
-        user_prompt,
-        model=REASONING_MODEL,
-        think="low",
-        num_ctx=32768,
-        num_predict=768,
-    )
-    answer = _validate(payload, evidence)
-    if evidence.get("computed"):
-        answer = _ground_with_computed(answer, evidence)
+    analysis = analyze(question, retrieval, computation)
+    controller = critique(question, retrieval, computation, analysis)
+
+    if not controller.get("approved", False) and computation is not None:
+        revision = analyze(
+            question,
+            {**retrieval, "warnings": retrieval.get("warnings", []) + controller.get("issues", [])},
+            computation,
+        )
+        if revision.get("answer_text"):
+            analysis = revision
+
+    if computation is not None:
+        answer = _from_computation(computation, data)
+        answer.explanation = analysis.get("answer_text") or ""
     else:
-        source_truth = _source_truth(question, evidence)
-        if source_truth is not None:
-            answer = _ground_with_source_truth(answer, source_truth)
+        answer = FinancialAnswer(
+            metric=analysis.get("metric") or "unknown",
+            answer=analysis.get("answer"),
+            period=analysis.get("period"),
+            currency=analysis.get("currency"),
+            unit=analysis.get("unit"),
+            status=analysis.get("status", "ambiguous"),
+            confidence=analysis.get("confidence", "low"),
+            formula=analysis.get("formula"),
+            inputs=analysis.get("inputs") or [],
+            sources=evidence_sources(retrieval.get("selected_facts", []), []),
+            explanation=analysis.get("answer_text") or analysis.get("explanation"),
+        )
+
     return {
         **answer.as_dict(),
         "llm_used": True,
-        "llm_model": REASONING_MODEL,
-        "retrieval_model": RETRIEVAL_MODEL,
-        "retrieval": retrieval_packet,
-        "evidence": evidence,
+        "models": {"embedding": retrieval.get("embedding_model"), "document": DOCUMENT_MODEL, "reasoning": REASONING_MODEL, "critic": CRITIC_MODEL},
+        "retrieval": retrieval,
+        "deterministic_computation": computation,
+        "analysis": analysis,
+        "controller": controller,
     }
