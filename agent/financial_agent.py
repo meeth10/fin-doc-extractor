@@ -130,7 +130,7 @@ def _total_debt(facts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not chosen:
         return None
     return {
-        "metric": "total_debt", "status": "reconstructed", "answer": round(sum(float(f.get("value", 0)) for f in chosen), 2),
+        "metric": "total_debt", "status": "derived", "derivation_type": "reconstructed", "answer": round(sum(float(f.get("value", 0)) for f in chosen), 2),
         "period": period, "formula": "sum of non-flow balance-sheet debt components",
         "inputs": [_input(f.get("label") or "Debt component", f) for f in chosen], "source": {"items": chosen},
         "confidence": "high" if all(f.get("validated") for f in chosen) else "medium",
@@ -237,7 +237,22 @@ def _arithmetic(metrics: List[str], operation: str, facts: Sequence[Dict[str, An
     }
 
 
-def _deterministic_computation(data: Dict[str, Any], selected: List[Dict[str, Any]], plan: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _deterministic_computation(first: Any, second: Any, third: Any, fourth: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """Compute from the normalized fact store.
+
+    Supports the current three-argument API `(data, selected_facts, plan)` and the
+    previous four-argument test/extension API `(question, data, selected_facts, plan)`.
+    The question argument is retained only for compatibility; the plan is authoritative.
+    """
+    if isinstance(first, str):
+        data = second
+        selected = third
+        plan = fourth or {}
+    else:
+        data = first
+        selected = second
+        plan = third
+
     facts = build_fact_store(data).get("facts", [])
     selected_ids = {f.get("fact_id") for f in selected}
     working = list(selected) + [f for f in facts if f.get("fact_id") not in selected_ids]
