@@ -34,6 +34,11 @@ def _decode_json_content(content: str) -> Dict[str, Any]:
 
 
 def _request_json(system: str, user: str, model: str, think: bool | str, num_ctx: int, num_predict: int) -> Dict[str, Any]:
+    parsed, _ = _request_json_with_raw(system, user, model, think, num_ctx, num_predict)
+    return parsed
+
+
+def _request_json_with_raw(system: str, user: str, model: str, think: bool | str, num_ctx: int, num_predict: int) -> tuple[Dict[str, Any], str]:
     payload = {
         "model": model,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -61,7 +66,9 @@ def _request_json(system: str, user: str, model: str, think: bool | str, num_ctx
         raise RuntimeError(f"Ollama returned HTTP {exc.code} at {OLLAMA_BASE_URL}: {detail or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Ollama is unavailable at {OLLAMA_BASE_URL}. Start it with `ollama serve`.") from exc
-    return _decode_json_content(body.get("message", {}).get("content", ""))
+    content = body.get("message", {}).get("content", "")
+    parsed = _decode_json_content(content)
+    return parsed, str(content)
 
 
 def chat_json(
@@ -83,3 +90,25 @@ def chat_json(
             raise
         retry_system = f"{system}\n\nCRITICAL OUTPUT CONTRACT: return exactly one valid JSON object. No markdown fences, no commentary, no leading or trailing text."
         return _request_json(retry_system, user, selected_model, think, context, output)
+
+
+def chat_json_with_trace(
+    system: str,
+    user: str,
+    model: str | None = None,
+    *,
+    think: bool | str = False,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+) -> tuple[Dict[str, Any], str]:
+    """Return parsed JSON plus the exact model content for debugging/auditing."""
+    selected_model = model or OLLAMA_MODEL
+    context = num_ctx or OLLAMA_CONTEXT
+    output = num_predict or OLLAMA_MAX_OUTPUT
+    try:
+        return _request_json_with_raw(system, user, selected_model, think, context, output)
+    except RuntimeError as exc:
+        if "invalid JSON" not in str(exc):
+            raise
+        retry_system = f"{system}\n\nCRITICAL OUTPUT CONTRACT: return exactly one valid JSON object. No markdown fences, no commentary, no leading or trailing text."
+        return _request_json_with_raw(retry_system, user, selected_model, think, context, output)
