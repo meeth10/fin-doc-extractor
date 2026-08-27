@@ -189,10 +189,17 @@ def _arithmetic(metrics: List[str], operation: str, facts: Sequence[Dict[str, An
         answer, formula = values[0] - values[1], " − ".join(metrics[:2])
     else:
         return None
-    return {"metric": "arithmetic_result", "status": "derived", "answer": round(answer, 2), "period": results[0].get("period"), "formula": formula, "inputs": [r["inputs"][0] for r in results], "source": {"items": [i for r in results for i in _items(r["source"])]}, "confidence": "high" if all(r.get("confidence") == "high" for r in results) else "medium", "scope": results[0].get("scope"), "definition": "Deterministic arithmetic over aligned reported facts."}
+    return {"metric": "arithmetic_result", "status": "derived", "answer": round(answer, 2), "period": results[0].get("period"), "formula": formula, "inputs": [r["inputs"][0] for r in results], "source": {"items": [i for r in results for i in _items(r["source"]) ]}, "confidence": "high" if all(r.get("confidence") == "high" for r in results) else "medium", "scope": results[0].get("scope"), "definition": "Deterministic arithmetic over aligned reported facts."}
 
 
 def _deterministic_computation(data: Dict[str, Any], selected: List[Dict[str, Any]], plan: Dict[str, Any], *legacy_args: Any) -> Optional[Dict[str, Any]]:
+    # Current API: (data, selected_facts, plan)
+    # Legacy API:  (question, data, selected_facts, plan)
+    # The older question parameter is intentionally ignored; the plan is authoritative.
+    if isinstance(data, str):
+        if not legacy_args:
+            raise TypeError("legacy _deterministic_computation call requires a plan as the fourth argument")
+        data, selected, plan = selected, plan, legacy_args[0]
     facts = build_fact_store(data).get("facts", [])
     selected_ids = {f.get("fact_id") for f in selected}
     working = list(selected) + [f for f in facts if f.get("fact_id") not in selected_ids]
