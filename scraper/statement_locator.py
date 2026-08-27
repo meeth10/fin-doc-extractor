@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from itertools import product
-
 from .models import StatementRegion
 
 TYPES = ("balance_sheet", "income_statement", "cash_flow")
@@ -19,37 +17,92 @@ def _peaks(pages: list[dict], threshold: float = 0.45) -> dict[str, list[tuple[i
     return result
 
 
+def _best_anchors(peaks: dict[str, list[tuple[int, float]]], max_span: int) -> dict[str, tuple[int, float]] | None:
+    """Choose one anchor per statement from the tightest high-confidence neighborhood."""
+    if sum(bool(values) for values in peaks.values()) < 3:
+        return None
+
+    candidates: list[tuple[float, int, dict[str, tuple[int, float]]]] = []
+    for bs in peaks["balance_sheet"]:
+        for inc in peaks["income_statement"]:
+            for cf in peaks["cash_flow"]:
+                anchors = {
+                    "balance_sheet": bs,
+                    "income_statement": inc,
+                    "cash_flow": cf,
+                }
+                pages = [page for page, _ in anchors.values()]
+                if len(set(pages)) != 3:
+                    continue
+
+                span = max(pages) - min(pages)
+                if span > max_span:
+                    continue
+
+                ordered_pages = sorted(pages)
+                adjacency = sum(
+                    1.0 / (1.0 + abs(ordered_pages[i] - ordered_pages[i - 1]))
+                    for i in range(1, len(ordered_pages))
+                )
+                score = sum(score for _, score in anchors.values())
+                score += adjacency
+                score -= 0.05 * span
+                candidates.append((score, span, anchors))
+
+    if not candidates:
+        return None
+
+    _, _, chosen = max(candidates, key=lambda item: (item[0], -item[1]))
+    return chosen
+
+
 def locate_statements(pages: list[dict], max_span: int = 8) -> list[StatementRegion]:
-    """Find the strongest nearby BS/IS/CF cluster, then absorb likely continuation pages."""
+    """Locate the balance-sheet/income/cash-flow neighborhood from page structure.
+
+    This layer deliberately does not normalize accounting terminology. It uses
+    structural signals and proximity; semantic mapping belongs downstream.
+    """
     peaks = _peaks(pages)
-    combos: list[tuple[float, dict[str, tuple[int, float]]]] = []
-    for bs, inc, cf in product(peaks["balance_sheet"], peaks["income_statement"], peaks["cash_flow"]):
-        nums = [bs[0], inc[0], cf[0]]
-        if len(set(nums)) < 3:
-            continue
-        span = max(nums) - min(nums)
-        if span > max_span:
-            continue
-        ordered = sorted((bs, inc, cf), key=lambda x: x[0])
-        proximity = sum(1 / (1 + abs(a[0] - b[0])) for a, b in ((ordered[0], ordered[1]), (ordered[1], ordered[2])))
-        score = bs[1] + inc[1] + cf[1] + proximity - 0.05 * span
-        combos.append((score, {"balance_sheet": bs, "income_statement": inc, "cash_flow": cf}))
+    chosen = _best_anchors(peaks, max_span)
 
-    if combos:
-        _, chosen = max(combos, key=lambda x: x[0])
-        starts = {kind: value[0] for kind, value in chosen.items()}
+    if chosen:
+        starts = {kind: anchor[0] for kind, anchor in chosen.items()}
+        ordered = sorted(starts.items(), key=lambda item: item[1])
         regions: list[StatementRegion] = []
-        ordered = sorted(starts.items(), key=lambda x: x[1])
-        for idx, (kind, start) in enumerate(ordered):
-            next_start = ordered[idx + 1][1] if idx + 1 < len(ordered) else start + 3
-            end = max(start, next_start - 1)
-            regions.append(StatementRegion(kind, start, end, round(chosen[kind][1], 3), list(range(start, end + 1))))
-        return sorted(regions, key=lambda x: x.start_page)
 
-    # Fallback: return isolated high-confidence candidates without pretending the block is certain.
-    regions = []
+        for index, (kind, start) in enumerate(ordered):
+            if index + 1 < len(ordered):
+                end = ordered[index + 1][1] - 1
+            else:
+                # Give the final statement a small continuation allowance.
+                end = start + 2
+
+            regions.append(
+                StatementRegion(
+                    statement_type=kind,
+                    start_page=start,
+                    end_page=end,
+                    confidence=round(chosen[kind][1], 3),
+                    evidence_pages=list(range(start, end + 1)),
+                )
+            )
+
+        return regions
+
+    # No complete neighborhood: return the strongest isolated candidate per type.
+    regions: list[StatementRegion] = []
     for kind in TYPES:
-        if peaks[kind]:
-            page, score = max(peaks[kind], key=lambda x: (x[1], -x[0]))
-            regions.append(StatementRegion(kind, page, page, round(score, 3), [page]))
-    return sorted(regions, key=lambda x: x.start_page)
+        if not peaks[kind]:
+            continue
+        page, score = max(peaks[kind], key=lambda item: (item[1], -item[0]))
+        regions.append(
+            StatementRegion(
+                statement_type=kind,
+                start_page=page,
+                end_page=page,
+                confidence=round(score, 3),
+                evidence_pages=[page],
+            )
+        )
+
+    return sorted(regions, key=lambda region: region.start_page)
