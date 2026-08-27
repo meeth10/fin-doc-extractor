@@ -1,6 +1,6 @@
 # Qwen financial analysis stack
 
-The local stack is intentionally small, sequential, and evidence-first for a 24 GB RAM workstation:
+The local stack is intentionally small, sequential, and evidence-first for a 24 GB RAM workstation.
 
 ```text
 PDF / extracted tables + narrative
@@ -47,6 +47,10 @@ The application invokes these models sequentially. `OLLAMA_KEEP_ALIVE=0` prevent
 6. Unsupported answers are returned as provisional rather than disguised as high-confidence facts.
 
 The Ollama client uses JSON-schema-constrained output for planner, analyst and verifier responses when supported by the installed Ollama version.
+
+## Validation status
+
+The final regression pass reached 69 passing tests with one remaining compatibility assertion; that assertion was corrected in the final debt-status fix on the rebuild branch.
 
 ## Install
 
