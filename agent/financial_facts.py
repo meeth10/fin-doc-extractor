@@ -266,7 +266,7 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
 def total_debt_candidates(facts: List[Dict[str, Any]], period: Optional[str] = None, scope: Optional[str] = None) -> List[Dict[str, Any]]:
     result: List[Dict[str, Any]] = []
     for fact in facts:
-        if fact.get("statement") != "balance_sheet" or fact.get("status") != "reported" or fact.get("is_flow_candidate"):
+        if fact.get("statement") != "balance_sheet" or fact.get("status", "reported") != "reported" or fact.get("is_flow_candidate"):
             continue
         if period and fact.get("period") != period:
             continue
