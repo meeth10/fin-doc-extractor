@@ -12,7 +12,15 @@ OLLAMA_CONTEXT = int(os.getenv("OLLAMA_CONTEXT", "32768"))
 OLLAMA_MAX_OUTPUT = int(os.getenv("OLLAMA_MAX_OUTPUT", "768"))
 
 
-def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any]:
+def chat_json(
+    system: str,
+    user: str,
+    model: str | None = None,
+    *,
+    think: bool | str = False,
+    num_ctx: int | None = None,
+    num_predict: int | None = None,
+) -> Dict[str, Any]:
     payload = {
         "model": model or OLLAMA_MODEL,
         "messages": [
@@ -21,12 +29,12 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         ],
         "stream": False,
         "format": "json",
-        "think": False,
+        "think": think,
         "keep_alive": "10m",
         "options": {
             "temperature": 0,
-            "num_ctx": OLLAMA_CONTEXT,
-            "num_predict": OLLAMA_MAX_OUTPUT,
+            "num_ctx": num_ctx or OLLAMA_CONTEXT,
+            "num_predict": num_predict or OLLAMA_MAX_OUTPUT,
         },
     }
     request = urllib.request.Request(
@@ -36,7 +44,7 @@ def chat_json(system: str, user: str, model: str | None = None) -> Dict[str, Any
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=180) as response:
             body = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = ""
