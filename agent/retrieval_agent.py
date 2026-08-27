@@ -18,7 +18,10 @@ Rules:
 4. Prefer aggregate rows for aggregate metrics: Total net sales over Products/Services; total debt over debt issuance.
 5. Preserve the exact reported values and periods.
 6. Select at most 6 source records unless the query genuinely requires more.
-7. Return exactly one JSON object matching the requested schema. No markdown.
+7. Return exactly one JSON object with this schema:
+   {"query_type": string, "selected_metrics": [string], "selected_sources": [object], "warnings": [string]}
+8. Never put the answer itself in the response. Retrieval only.
+9. No markdown.
 """
 
 
@@ -78,32 +81,56 @@ def retrieve(question: str, evidence: Dict[str, Any]) -> Dict[str, Any]:
         "computed": evidence.get("computed"), "candidate_index": index,
     }
     user = "Select evidence only from candidate_index. Never answer the question.\n\n" + json.dumps(payload, ensure_ascii=False)
+    raw_output = None
+    granite_result = None
     try:
-        result, raw_output = chat_json_with_trace(
+        granite_result, raw_output = chat_json_with_trace(
             SYSTEM_PROMPT, user, model=RETRIEVAL_MODEL, think=False, num_ctx=8192, num_predict=384
         )
-        selected = result.get("selected_sources")
+        selected = granite_result.get("selected_sources")
         if not isinstance(selected, list):
             raise RuntimeError("Granite retrieval JSON missing selected_sources")
+
         allowed = {_record_key(x): x for x in index}
         clean = []
+        rejected = []
         for item in selected[:6]:
-            if isinstance(item, dict):
-                key = _record_key(item)
-                if key in allowed:
-                    clean.append(allowed[key])
+            if not isinstance(item, dict):
+                rejected.append({"item": item, "reason": "not an object"})
+                continue
+            key = _record_key(item)
+            if key in allowed:
+                clean.append(allowed[key])
+            else:
+                rejected.append({"item": item, "reason": "not present in candidate_index"})
+
         if not clean and index:
             fallback = _deterministic_fallback(evidence, "Granite selected no valid candidate records.")
             fallback["raw_model_output"] = raw_output
+            fallback["granite_response"] = granite_result
+            fallback["granite_selected_sources_raw"] = selected
+            fallback["rejected_selections"] = rejected
+            fallback["candidate_index"] = index
             fallback["model"] = RETRIEVAL_MODEL
             return fallback
+
+        result = dict(granite_result)
         result["selected_sources"] = clean
+        result["granite_selected_sources_raw"] = selected
+        result["rejected_selections"] = rejected
+        result["candidate_index"] = index
         result["raw_model_output"] = raw_output
         result["model"] = RETRIEVAL_MODEL
         result["fallback"] = False
         return result
     except (RuntimeError, TypeError, ValueError) as exc:
         fallback = _deterministic_fallback(evidence, f"Granite retrieval fallback used: {exc}")
-        fallback["raw_model_output"] = None
+        fallback["raw_model_output"] = raw_output
+        fallback["granite_response"] = granite_result
+        fallback["granite_selected_sources_raw"] = (
+            granite_result.get("selected_sources") if isinstance(granite_result, dict) else None
+        )
+        fallback["rejected_selections"] = []
+        fallback["candidate_index"] = index
         fallback["model"] = RETRIEVAL_MODEL
         return fallback
