@@ -19,3 +19,7 @@ dependencies = [
 
 [tool.setuptools]
 packages = ["extractor", "web", "agent"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
