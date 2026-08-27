@@ -5,8 +5,6 @@ from typing import Any, Dict, Tuple
 
 from .ollama_client import chat_json_with_trace
 
-# Sized for a 24 GB RAM workstation. Ollama unloads models between calls by default,
-# so the 4B/8B/4B sequence does not require three large resident models.
 PLANNER_MODEL = "qwen3:4b"
 ANALYST_MODEL = "qwen3:8b"
 VERIFIER_MODEL = "qwen3:4b"
@@ -14,6 +12,7 @@ VERIFIER_MODEL = "qwen3:4b"
 ANALYST_SCHEMA = {
     "type": "object",
     "properties": {
+        "answer": {"type": ["number", "string", "null"]},
         "answer_text": {"type": "string"},
         "metric": {"type": ["string", "null"]},
         "status": {"type": "string", "enum": ["reported", "derived", "reconstructed", "inferred", "ambiguous", "not_available"]},
@@ -26,7 +25,7 @@ ANALYST_SCHEMA = {
         "inputs": {"type": "array", "items": {"type": "object"}},
         "explanation": {"type": "string"},
     },
-    "required": ["answer_text", "metric", "status", "confidence", "period", "currency", "unit", "scope", "formula", "inputs", "explanation"],
+    "required": ["answer", "answer_text", "metric", "status", "confidence", "period", "currency", "unit", "scope", "formula", "inputs", "explanation"],
 }
 
 VERIFIER_SCHEMA = {
@@ -51,11 +50,12 @@ Rules:
 4. For analytical questions, explain the evidence and clearly label inference.
 5. If evidence is insufficient, say so rather than guessing.
 6. Use the exact unit and currency from the evidence.
+7. Put the primary numeric/string result in `answer`; put the human-readable response in `answer_text`.
 Return exactly one JSON object matching the supplied schema."""
 
 VERIFIER_PROMPT = """You are an independent financial controller reviewing an answer.
 Audit ONLY against the supplied evidence and calculation graph.
-Check: metric identity, period alignment, scope, units/currency, stock-vs-flow, arithmetic, formula validity, aggregate double-counting, and unsupported causal claims.
+Check metric identity, period alignment, scope, units/currency, stock-vs-flow, arithmetic, formula validity, aggregate double-counting, and unsupported causal claims.
 Approve only when the answer is fully supported. A correct number with a misleading definition should be rejected.
 Return exactly one JSON object matching the supplied schema."""
 
