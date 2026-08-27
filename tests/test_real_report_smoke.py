@@ -35,5 +35,5 @@ def test_real_report_smoke(tmp_path):
     )
 
     artifacts = result.get("artifacts", {})
-    extracted_json = artifacts.get("json")
+    extracted_json = artifacts.get("document_json")
     assert extracted_json and Path(extracted_json).exists()
