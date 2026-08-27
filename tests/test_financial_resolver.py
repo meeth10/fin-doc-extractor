@@ -1,4 +1,5 @@
 from extractor.financial_resolver import build_evidence, metric_from_question, question_intent, resolve_metric
+from agent.query_semantics import normalize_question
 
 
 def sample_data():
@@ -17,10 +18,13 @@ def test_metric_from_question():
     assert metric_from_question("What was the cash balance?") == "cash_and_equivalents"
     assert metric_from_question("What was EBITDA?") == "ebitda"
     assert metric_from_question("What was EV?") == "enterprise_value"
-    assert metric_from_question("What was operational income?") == "ebit"
-    assert metric_from_question("What was operating income?") == "ebit"
-    assert metric_from_question("What was the expense?") == "total_expenses"
-    assert metric_from_question("What were total expenses?") == "total_expenses"
+
+
+def test_question_normalization():
+    assert normalize_question("What was operational income?") == "What was operating income?"
+    assert normalize_question("What was operational profit?") == "What was operating profit?"
+    assert normalize_question("What was the expense?") == "What was the total expenses?"
+    assert normalize_question("What were expenses?") == "What were total expenses?"
 
 
 def test_change_intent():
