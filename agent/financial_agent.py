@@ -10,19 +10,21 @@ from .ollama_client import chat_json
 from .retrieval_agent import retrieve
 
 REASONING_MODEL = "deepseek-r1:14b"
+RETRIEVAL_MODEL = "ibm/granite4.2:3b"
 
 SYSTEM_PROMPT = """You are the senior financial reasoning analyst.
-You receive a user question plus a retrieval packet selected by a separate retrieval model.
+You receive one question and a compact evidence packet selected by a separate retrieval model.
 
 Rules:
-1. Use only the supplied retrieval packet and deterministic computed evidence.
+1. Use only the supplied evidence packet and deterministic computed evidence.
 2. Never invent a number, period, unit, or source.
 3. Prefer directly reported aggregate line items over components.
 4. If `computed` is present, it is authoritative and must be used exactly.
 5. Distinguish reported from derived values.
-6. For derived metrics, show the formula and the actual input values.
+6. For derived metrics, show the formula and actual input values.
 7. If evidence is insufficient or conflicts, return ambiguous/not_available rather than guessing.
-8. Return JSON only:
+8. Keep the explanation concise: 2-5 sentences unless the question asks for analysis.
+9. Return exactly one valid JSON object and nothing else:
 {
   "metric": string,
   "answer": number|string|null,
@@ -172,14 +174,13 @@ def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         "question": question,
         "computed": evidence.get("computed"),
         "document": evidence.get("document"),
-        "retrieval": retrieval_packet,
-        "evidence_candidates": retrieval_packet.get("selected_sources", []),
+        "selected_sources": retrieval_packet.get("selected_sources", []),
         "retrieval_warnings": retrieval_packet.get("warnings", []),
     }
     user_prompt = (
-        "Reason through the financial question using ONLY this packet. "
-        "The retrieval specialist selected the evidence; do not go back to unsupported facts. "
-        "If `computed` is present, it is authoritative.\n\n"
+        "Reason through the question using ONLY this compact evidence packet. "
+        "Do not use prior knowledge or unsupported facts. "
+        "If `computed` is present, it is authoritative and must be used exactly.\n\n"
         f"{json.dumps(reasoning_input, ensure_ascii=False)}\n\n"
         f"Question: {question}"
     )
@@ -187,9 +188,9 @@ def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         SYSTEM_PROMPT,
         user_prompt,
         model=REASONING_MODEL,
-        think=True,
+        think="low",
         num_ctx=32768,
-        num_predict=1024,
+        num_predict=768,
     )
     answer = _validate(payload, evidence)
     if evidence.get("computed"):
@@ -202,7 +203,7 @@ def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
         **answer.as_dict(),
         "llm_used": True,
         "llm_model": REASONING_MODEL,
-        "retrieval_model": "ibm/granite4.2:3b",
+        "retrieval_model": RETRIEVAL_MODEL,
         "retrieval": retrieval_packet,
         "evidence": evidence,
     }
