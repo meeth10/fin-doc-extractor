@@ -31,39 +31,34 @@ PLAN_SCHEMA = {
 
 PLANNER_PROMPT = """You are the query planner for a financial filing analysis engine.
 Convert the user's question into a retrieval/calculation plan. Do not answer the question.
-Use only concepts from the supplied vocabulary when possible.
+Use the financial concept vocabulary supplied by the application.
 Rules:
-- Distinguish a reported metric from a derived metric.
-- Treat 'why', 'driver', 'cause', 'impact', 'trend', 'risk', 'quality', and strategy questions as narrative/analytical.
-- For 'increase/decrease/change/growth/yoy' select yoy_change or yoy_percent as appropriate.
+- If the wording says adjusted EBITDA, select adjusted_ebitda and NOT ebitda.
+- Distinguish reported metrics from derived metrics.
+- Treat why/driver/cause/impact/trend/risk/quality/strategy questions as analytical.
 - Resolve explicit years into target_period/comparison_period.
 - Default scope to unknown; never invent consolidated/standalone status.
 Return exactly one JSON object matching the schema."""
 
 _METRIC_TERMS = {
-    "cash_and_equivalents": ("cash", "cash balance", "cash and cash equivalents"),
+    "adjusted_ebitda": ("adjusted ebitda",),
+    "enterprise_value": ("enterprise value", "ev"),
+    "total_debt": ("total debt", "debt", "borrowings"),
+    "cash_and_equivalents": ("cash and cash equivalents", "cash balance", "cash"),
     "revenue": ("revenue", "sales", "turnover"),
     "ebitda": ("ebitda",),
-    "adjusted_ebitda": ("adjusted ebitda",),
     "ebit": ("ebit", "operating profit", "operating income"),
     "depreciation": ("depreciation", "amortisation", "amortization"),
     "pat": ("profit after tax", "net profit", "net income", "pat"),
     "pbt": ("profit before tax", "pbt"),
     "finance_costs": ("finance cost", "finance costs", "interest expense"),
-    "total_debt": ("total debt", "debt", "borrowings"),
     "total_assets": ("total assets",),
     "total_equity": ("total equity", "shareholders' equity"),
     "cfo": ("operating cash flow", "cash flow from operating activities", "cfo"),
     "capex": ("capital expenditure", "capex", "purchase of property"),
     "total_expenses": ("total expenses", "total expense", "expenditure", "costs"),
-    "market_capitalization": ("market capitalization", "market cap"),
-    "enterprise_value": ("enterprise value", "ev"),
 }
-
-_ANALYTICAL_HINTS = {
-    "why", "explain", "reason", "driver", "drivers", "cause", "causes", "impact",
-    "trend", "quality", "risk", "outlook", "strategy", "margin analysis", "what drove",
-}
+_ANALYTICAL_HINTS = {"why", "explain", "reason", "driver", "drivers", "cause", "causes", "impact", "trend", "quality", "risk", "outlook", "strategy", "what drove"}
 YEAR_RE = re.compile(r"(?:FY\s*)?(?:19|20)\d{2}(?:[-/–]\d{2})?", re.I)
 
 
@@ -74,16 +69,24 @@ def _tokens(text: str) -> set[str]:
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if not a or not b:
         return 0.0
-    length = min(len(a), len(b))
-    dot = sum(a[i] * b[i] for i in range(length))
+    n = min(len(a), len(b))
+    dot = sum(a[i] * b[i] for i in range(n))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(x * x for x in b))
     return dot / (na * nb) if na and nb else 0.0
 
 
 def _simple_value_question(question: str) -> bool:
-    lowered = question.lower()
-    return not any(hint in lowered for hint in _ANALYTICAL_HINTS)
+    return not any(hint in question.lower() for hint in _ANALYTICAL_HINTS)
+
+
+def _normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    result = dict(plan)
+    metrics = list(dict.fromkeys(str(m) for m in result.get("metrics") or []))
+    if "adjusted_ebitda" in metrics and "ebitda" in metrics:
+        metrics.remove("ebitda")
+    result["metrics"] = metrics
+    return result
 
 
 def _heuristic_plan(question: str) -> Dict[str, Any]:
@@ -92,12 +95,15 @@ def _heuristic_plan(question: str) -> Dict[str, Any]:
     for metric, aliases in _METRIC_TERMS.items():
         if any(re.search(rf"(?<!\w){re.escape(alias)}(?!\w)", lowered) for alias in aliases):
             metrics.append(metric)
+    if "adjusted ebitda" in lowered:
+        metrics = [m for m in metrics if m != "ebitda"]
+        if "adjusted_ebitda" not in metrics:
+            metrics.insert(0, "adjusted_ebitda")
     if not metrics and "expense" in lowered:
         metrics = ["total_expenses"]
-    operation = "value"
     if any(x in lowered for x in ("percentage increase", "percent increase", "% increase", "% growth", "growth rate", "percentage change")):
         operation = "yoy_percent"
-    elif any(x in lowered for x in ("increase", "decrease", "change", "growth", "decline", "yoy", "year over year", "vs ", "versus")):
+    elif any(x in lowered for x in ("increase", "decrease", "change", "growth", "decline", "yoy", "year over year", "versus")):
         operation = "yoy_change"
     elif any(x in lowered for x in ("sum of", "plus", "combined", "add ")):
         operation = "sum"
@@ -105,22 +111,20 @@ def _heuristic_plan(question: str) -> Dict[str, Any]:
         operation = "difference"
     elif not _simple_value_question(question):
         operation = "explain"
+    else:
+        operation = "value"
     years = YEAR_RE.findall(question)
-    target_period = years[0] if years else None
-    comparison_period = years[1] if len(years) > 1 else None
-    scope = "consolidated" if "consolidated" in lowered else ("standalone" if "standalone" in lowered else "unknown")
-    basis = "reported" if operation == "value" else "unknown"
-    return {
+    return _normalize_plan({
         "metrics": metrics,
         "operation": operation,
-        "target_period": target_period,
-        "comparison_period": comparison_period,
-        "scope": scope,
-        "basis": basis,
+        "target_period": years[0] if years else None,
+        "comparison_period": years[1] if len(years) > 1 else None,
+        "scope": "consolidated" if "consolidated" in lowered else ("standalone" if "standalone" in lowered else "unknown"),
+        "basis": "reported" if operation == "value" else "unknown",
         "needs_narrative": operation == "explain",
         "definition": "user-requested financial metric",
         "confidence": "medium" if metrics else "low",
-    }
+    })
 
 
 def _valid_plan(plan: Dict[str, Any]) -> bool:
@@ -131,15 +135,8 @@ def _valid_plan(plan: Dict[str, Any]) -> bool:
 def plan_question(question: str) -> Tuple[Dict[str, Any], bool, str | None]:
     heuristic = _heuristic_plan(question)
     try:
-        result, raw = chat_json_with_trace(
-            PLANNER_PROMPT,
-            json.dumps({"question": question, "heuristic_plan": heuristic}, ensure_ascii=False),
-            model=PLANNER_MODEL,
-            think=False,
-            num_ctx=6144,
-            num_predict=320,
-            format_schema=PLAN_SCHEMA,
-        )
+        result, raw = chat_json_with_trace(PLANNER_PROMPT, json.dumps({"question": question, "heuristic_plan": heuristic}, ensure_ascii=False), model=PLANNER_MODEL, think=False, num_ctx=6144, num_predict=320, format_schema=PLAN_SCHEMA)
+        result = _normalize_plan(result)
         if _valid_plan(result):
             return result, True, raw
     except RuntimeError:
@@ -155,24 +152,23 @@ def _rank_facts(question: str, facts: List[Dict[str, Any]], plan: Dict[str, Any]
     scope = plan.get("scope")
     scored: List[Tuple[float, Dict[str, Any]]] = []
     for fact in facts:
-        text = fact_text(fact)
-        score = float(len(query_tokens & _tokens(text)))
+        score = float(len(query_tokens & _tokens(fact_text(fact))))
         if fact.get("metric") in metrics:
             score += 6.0
         if fact.get("validated"):
             score += 1.5
-        if fact.get("statement_confidence", 0) >= 0.9:
+        if float(fact.get("statement_confidence", 0) or 0) >= 0.9:
             score += 1.0
         if target_period and str(fact.get("period")) == str(target_period):
             score += 4.0
         if scope and scope != "unknown" and fact.get("scope") == scope:
             score += 3.0
-        if fact.get("statement") == "balance_sheet" and "total_debt" in metrics:
+        if "total_debt" in metrics and fact.get("statement") == "balance_sheet":
             score += 1.5
-        if fact.get("is_flow_candidate") and "total_debt" in metrics:
+        if "total_debt" in metrics and fact.get("is_flow_candidate"):
             score -= 6.0
-        if fact.get("status") == "derived" and plan.get("basis") == "reported":
-            score -= 2.0
+        if plan.get("basis") == "reported" and fact.get("status") != "reported":
+            score -= 3.0
         if score > 0:
             scored.append((score, fact))
     scored.sort(key=lambda pair: (-pair[0], pair[1].get("page") or 10**9, pair[1].get("row_index") or 10**9))
@@ -190,9 +186,9 @@ def _chunk_pages(data: Dict[str, Any], chunk_size: int = 1400, overlap: int = 18
         part = 0
         while start < len(text):
             end = min(len(text), start + chunk_size)
-            chunk = text[start:end].strip()
-            if chunk:
-                chunks.append({"chunk_id": f"p{page_number}-c{part}", "page": page_number, "text": chunk})
+            fragment = text[start:end].strip()
+            if fragment:
+                chunks.append({"chunk_id": f"p{page_number}-c{part}", "page": page_number, "text": fragment})
             if end >= len(text):
                 break
             start = max(0, end - overlap)
@@ -203,14 +199,14 @@ def _chunk_pages(data: Dict[str, Any], chunk_size: int = 1400, overlap: int = 18
 def _fingerprint(items: List[Dict[str, Any]]) -> str:
     digest = hashlib.sha256()
     for item in items:
-        digest.update(str(item.get("id") or item.get("fact_id") or item.get("chunk_id")).encode())
+        digest.update(str(item.get("fact_id") or item.get("chunk_id")).encode())
         digest.update(str(item.get("text") or fact_text(item)).encode())
         digest.update(str(item.get("value")).encode())
         digest.update(str(item.get("period")).encode())
     return digest.hexdigest()
 
 
-def _embed_cached(items: List[Dict[str, Any]], out_dir: str, filename: str, item_key: str) -> List[Dict[str, Any]]:
+def _embed_cached(items: List[Dict[str, Any]], out_dir: str, filename: str) -> List[Dict[str, Any]]:
     if not items:
         return []
     path = Path(out_dir) / filename
@@ -224,10 +220,10 @@ def _embed_cached(items: List[Dict[str, Any]], out_dir: str, filename: str, item
                     return cached
         except (OSError, ValueError, TypeError):
             pass
-    vectors = embed_texts([str(item.get("text") or fact_text(item)) for item in items], EMBEDDING_MODEL)
+    vectors = embed_texts([str(x.get("text") or fact_text(x)) for x in items], EMBEDDING_MODEL)
     enriched = [{**item, "embedding": vector} for item, vector in zip(items, vectors)]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"fingerprint": fp, "model": EMBEDDING_MODEL, "item_key": item_key, "items": enriched}, ensure_ascii=False), encoding="utf-8")
+    path.write_text(json.dumps({"fingerprint": fp, "model": EMBEDDING_MODEL, "items": enriched}, ensure_ascii=False), encoding="utf-8")
     return enriched
 
 
@@ -236,45 +232,38 @@ def _without_embedding(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def retrieve(question: str, data: Dict[str, Any], *, out_dir: str = "output", plan: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    resolved_plan = plan
+    resolved_plan = _normalize_plan(plan or _heuristic_plan(question))
     planner_used = False
     planner_raw = None
-    if resolved_plan is None:
+    if plan is None:
         resolved_plan, planner_used, planner_raw = plan_question(question)
-
     store = build_fact_store(data)
     facts = store.get("facts", [])
-    lexical_ranked = _rank_facts(question, facts, resolved_plan)
+    lexical = _rank_facts(question, facts, resolved_plan)
+    semantic_ranked: List[Dict[str, Any]] = []
     warnings: List[str] = []
     query_embedding: List[float] = []
-    semantic_ranked: List[Dict[str, Any]] = []
     try:
-        fact_items = [{**fact, "text": fact_text(fact)} for fact in facts]
-        embedded_facts = _embed_cached(fact_items, out_dir, "qwen_fact_embedding_cache.json", "fact_id")
-        query_embedding = embed_texts([question], EMBEDDING_MODEL)[0] if embedded_facts else []
-        if query_embedding:
-            semantic_ranked = sorted(embedded_facts, key=lambda f: _cosine(query_embedding, f.get("embedding", [])), reverse=True)
-            semantic_score = {f.get("fact_id"): _cosine(query_embedding, f.get("embedding", [])) for f in embedded_facts}
-            metric_rank = {f.get("fact_id"): i for i, f in enumerate(lexical_ranked)}
-            merged_ids = {f.get("fact_id") for f in lexical_ranked}
-            merged = []
+        embedded = _embed_cached([{**f, "text": fact_text(f)} for f in facts], out_dir, "qwen_fact_embedding_cache.json")
+        if embedded:
+            query_embedding = embed_texts([question], EMBEDDING_MODEL)[0]
+            semantic_ranked = sorted(embedded, key=lambda f: _cosine(query_embedding, f.get("embedding", [])), reverse=True)
+            semantic_scores = {f.get("fact_id"): _cosine(query_embedding, f.get("embedding", [])) for f in embedded}
+            lexical_rank = {f.get("fact_id"): i for i, f in enumerate(lexical)}
+            merged: List[Tuple[float, Dict[str, Any]]] = []
             for fact in facts:
                 fid = fact.get("fact_id")
-                lexical_bonus = max(0.0, 1.0 - metric_rank.get(fid, 80) / 80.0)
-                semantic_bonus = semantic_score.get(fid, 0.0)
-                structured_bonus = 0.0
-                if fid in merged_ids:
-                    structured_bonus = 0.75
-                total = lexical_bonus + semantic_bonus + structured_bonus
-                if total > 0:
-                    merged.append((total, fact))
+                lexical_component = max(0.0, 1.0 - lexical_rank.get(fid, 80) / 80.0)
+                semantic_component = max(0.0, semantic_scores.get(fid, 0.0))
+                structured_component = 0.75 if fid in lexical_rank else 0.0
+                merged.append((lexical_component + semantic_component + structured_component, fact))
             merged.sort(key=lambda pair: (-pair[0], pair[1].get("page") or 10**9, pair[1].get("row_index") or 10**9))
             ranked_facts = [fact for _, fact in merged[:40]]
         else:
-            ranked_facts = lexical_ranked
+            ranked_facts = lexical
     except RuntimeError as exc:
         warnings.append(f"Embedding retrieval unavailable; using structured ranking only: {exc}")
-        ranked_facts = lexical_ranked
+        ranked_facts = lexical
 
     selected_facts = ranked_facts[:16]
     selected_chunks: List[Dict[str, Any]] = []
@@ -282,9 +271,9 @@ def retrieve(question: str, data: Dict[str, Any], *, out_dir: str = "output", pl
     if resolved_plan.get("needs_narrative") or not selected_facts or resolved_plan.get("operation") == "explain":
         chunks = _chunk_pages(data)
         try:
-            embedded_chunks = _embed_cached(chunks, out_dir, "qwen_narrative_embedding_cache.json", "chunk_id")
-            ranked_chunks = sorted(embedded_chunks, key=lambda c: _cosine(query_embedding, c.get("embedding", [])), reverse=True) if query_embedding else embedded_chunks[:8]
-            candidate_chunks = [_without_embedding(c) for c in ranked_chunks[:16]]
+            embedded_chunks = _embed_cached(chunks, out_dir, "qwen_narrative_embedding_cache.json")
+            chunk_ranked = sorted(embedded_chunks, key=lambda c: _cosine(query_embedding, c.get("embedding", [])), reverse=True) if query_embedding else embedded_chunks[:8]
+            candidate_chunks = [_without_embedding(c) for c in chunk_ranked[:16]]
             selected_chunks = candidate_chunks[:8]
         except RuntimeError as exc:
             warnings.append(f"Narrative embeddings unavailable: {exc}")
