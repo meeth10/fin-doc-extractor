@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from extractor.financial_resolver import compute_ebitda, compute_enterprise_value, resolve_metric, resolve_raw_text
 
 FACT_ALIASES: Dict[str, Tuple[str, ...]] = {
     "cash_and_equivalents": ("cash and cash equivalents", "cash equivalents", "cash balance", "cash and bank balances", "cash and balances with banks"),
     "revenue": ("revenue from operations", "total revenue", "revenue", "net sales", "sales", "turnover"),
-    "ebitda": ("adjusted ebitda", "operating ebitda", "ebitda"),
+    "ebitda": ("operating ebitda", "ebitda"),
+    "adjusted_ebitda": ("adjusted ebitda",),
     "ebit": ("operating profit", "profit from operations", "operating income", "ebit"),
     "depreciation": ("depreciation and amortisation", "depreciation and amortization", "depreciation & amortisation", "depreciation & amortization", "depreciation"),
     "pat": ("profit attributable to owners", "profit for the year", "profit for the period", "profit after tax", "net profit", "net income"),
@@ -31,7 +32,6 @@ DEBT_COMPONENT_LABELS = (
 DEBT_FLOW_LABELS = ("proceeds", "issuance", "repayments", "repayment", "cash flow", "borrowings issued")
 
 YEAR_RE = re.compile(r"(?:FY\s*)?(?:19|20)\d{2}(?:[-/–]\d{2})?", re.I)
-NUMBER_RE = re.compile(r"(?:₹|\$|€|£)?\s*[-−(]?\s*\d[\d,]*(?:\.\d+)?\s*\)?%?")
 
 
 def _norm(value: Any) -> str:
@@ -97,7 +97,7 @@ def _metric_for_label(label: str) -> Optional[str]:
                 candidates.append((len(a), metric))
     if not candidates:
         return None
-    return max(candidates)[1]
+    return max(candidates, key=lambda item: item[0])[1]
 
 
 def _is_debt_flow(label: str, statement: str) -> bool:
@@ -193,22 +193,19 @@ def _resolver_facts(metric: str, data: Dict[str, Any], metadata: Dict[str, Any])
 
 def _fact_key(fact: Dict[str, Any]) -> Tuple[Any, ...]:
     return (
-        fact.get("metric"),
-        _norm(fact.get("label")),
-        fact.get("value"),
-        fact.get("period"),
-        fact.get("scope"),
-        fact.get("page"),
-        fact.get("statement"),
-        fact.get("row_index"),
-        fact.get("column_index"),
+        fact.get("metric"), _norm(fact.get("label")), fact.get("value"), fact.get("period"),
+        fact.get("scope"), fact.get("page"), fact.get("statement"), fact.get("row_index"), fact.get("column_index"),
     )
 
 
 def _same_fact(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    try:
+        same_value = abs(float(a.get("value", 0)) - float(b.get("value", 0))) < 1e-9
+    except (TypeError, ValueError):
+        same_value = a.get("value") == b.get("value")
     return (
         a.get("metric") == b.get("metric")
-        and abs(float(a.get("value", 0)) - float(b.get("value", 0))) < 1e-9
+        and same_value
         and a.get("period") == b.get("period")
         and a.get("page") == b.get("page")
         and a.get("statement") == b.get("statement")
@@ -219,26 +216,19 @@ def _same_fact(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
 def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
     metadata = data.get("summary", {}).get("metadata", {}) or {}
     facts: List[Dict[str, Any]] = []
-
     for statement, bucket in (data.get("statement_tables") or {}).items():
         for table in bucket.get("tables", []):
             facts.extend(_table_facts(statement, table, metadata))
 
-    # Only fill genuinely absent concepts from the older resolver; do not duplicate
-    # structured table facts merely because a row also matches an alias.
     resolver_metrics = (
         "revenue", "ebit", "pat", "pbt", "depreciation", "finance_costs",
-        "cash_and_equivalents", "cfo", "capex", "total_assets", "total_equity",
-        "market_capitalization",
+        "cash_and_equivalents", "cfo", "capex", "total_assets", "total_equity", "market_capitalization",
     )
     for metric in resolver_metrics:
-        candidates = _resolver_facts(metric, data, metadata)
-        for candidate in candidates:
+        for candidate in _resolver_facts(metric, data, metadata):
             if not any(_same_fact(candidate, existing) for existing in facts):
                 facts.append(candidate)
 
-    # Add at most one derived record for explicit EBITDA/EV so they can be retrieved,
-    # but keep their input graph intact instead of pretending they are reported facts.
     derived: List[Dict[str, Any]] = []
     for calculation in (compute_ebitda(data), compute_enterprise_value(data)):
         if calculation and calculation.get("status") == "derived":
@@ -258,31 +248,18 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
     for calculation in derived:
         unique.append({
             "fact_id": f"d{len(unique)}",
-            "metric": calculation.get("metric"),
-            "label": calculation.get("metric"),
-            "value": calculation.get("answer"),
-            "period": calculation.get("period"),
-            "column_index": None,
-            "page": None,
-            "statement": None,
-            "table_title": None,
-            "source": "calculation_engine",
-            "validated": True,
-            "score": 1.0,
-            "statement_confidence": 1.0,
-            "section_context": None,
-            "scope": "unknown",
-            "unit": _scale_from_metadata(metadata),
-            "row_index": None,
-            "is_flow_candidate": False,
-            "status": "derived",
-            "formula": calculation.get("formula"),
+            "metric": calculation.get("metric"), "label": calculation.get("metric"),
+            "value": calculation.get("answer"), "period": calculation.get("period"), "column_index": None,
+            "page": None, "statement": None, "table_title": None, "source": "calculation_engine",
+            "validated": True, "score": 1.0, "statement_confidence": 1.0, "section_context": None,
+            "scope": "unknown", "unit": _scale_from_metadata(metadata), "row_index": None,
+            "is_flow_candidate": False, "status": "derived", "formula": calculation.get("formula"),
             "inputs": calculation.get("inputs", []),
             "fact_key": ("derived", calculation.get("metric"), calculation.get("period"), calculation.get("answer")),
         })
 
     return {
-        "schema_version": "3.0",
+        "schema_version": "3.1",
         "document": {
             "source_name": data.get("summary", {}).get("source_name"),
             "currency": metadata.get("currency"),
