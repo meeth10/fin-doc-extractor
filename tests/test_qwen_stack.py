@@ -14,8 +14,20 @@ def apple_facts():
 def test_apple_total_debt():
     result = _total_debt(apple_facts())
     assert result["answer"] == 98657.0
-    assert result["status"] == "derived"
+    assert result["status"] == "reconstructed"
     assert len(result["inputs"]) == 3
+
+
+def test_explicit_total_debt_wins_over_components():
+    facts = apple_facts() + [{
+        "fact_id": "f5", "metric": "total_debt", "label": "Total debt", "value": 99000.0,
+        "period": "2025", "page": 34, "statement": "balance_sheet", "validated": True,
+        "is_flow_candidate": False,
+    }]
+    result = _total_debt(facts)
+    assert result["answer"] == 99000.0
+    assert result["status"] == "reported"
+    assert len(result["inputs"]) == 1
 
 
 def test_debt_flow_is_ranked_below_balance_sheet():
@@ -25,6 +37,6 @@ def test_debt_flow_is_ranked_below_balance_sheet():
     assert 36 not in pages or pages.index(34) < pages.index(36)
 
 
-def test_simple_question_does_not_require_semantic_retrieval():
+def test_simple_question_does_not_require_narrative_agent():
     assert _simple_value_question("What was total debt?") is True
     assert _simple_value_question("Why did leverage increase?") is False
