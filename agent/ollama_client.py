@@ -41,7 +41,8 @@ def _post(path: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read().decode("utf-8"))
+            raw = response.read().decode("utf-8")
+            return json.loads(raw)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -55,6 +56,8 @@ def _post(path: str, payload: Dict[str, Any], timeout: int) -> Dict[str, Any]:
         raise RuntimeError(
             f"Ollama is unavailable at {OLLAMA_BASE_URL}. Start it with `ollama serve`."
         ) from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Ollama returned a malformed HTTP JSON response.") from exc
 
 
 def _request_json_with_raw(
@@ -64,27 +67,25 @@ def _request_json_with_raw(
     think: bool | str,
     num_ctx: int,
     num_predict: int,
+    format_schema: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], str]:
-    body = _post(
-        "/api/chat",
-        {
-            "model": model,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            "stream": False,
-            "format": "json",
-            "think": think,
-            "keep_alive": OLLAMA_KEEP_ALIVE,
-            "options": {
-                "temperature": 0,
-                "num_ctx": num_ctx,
-                "num_predict": num_predict,
-            },
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "format": format_schema or "json",
+        "think": think,
+        "keep_alive": OLLAMA_KEEP_ALIVE,
+        "options": {
+            "temperature": 0,
+            "num_ctx": num_ctx,
+            "num_predict": num_predict,
         },
-        OLLAMA_TIMEOUT,
-    )
+    }
+    body = _post("/api/chat", payload, OLLAMA_TIMEOUT)
     content = body.get("message", {}).get("content", "")
     return _decode_json_content(content), str(content)
 
@@ -97,20 +98,25 @@ def chat_json_with_trace(
     think: bool | str = False,
     num_ctx: int | None = None,
     num_predict: int | None = None,
+    format_schema: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], str]:
     selected_model = model or OLLAMA_MODEL
     context = num_ctx or OLLAMA_CONTEXT
     output = num_predict or OLLAMA_MAX_OUTPUT
     try:
-        return _request_json_with_raw(system, user, selected_model, think, context, output)
+        return _request_json_with_raw(
+            system, user, selected_model, think, context, output, format_schema
+        )
     except RuntimeError as exc:
-        if "invalid JSON" not in str(exc):
+        message = str(exc)
+        if "invalid JSON" not in message:
             raise
         retry_system = (
-            f"{system}\n\nCRITICAL OUTPUT CONTRACT: return exactly one valid JSON object."
+            f"{system}\n\nCRITICAL OUTPUT CONTRACT: return exactly one valid JSON object "
+            "and no markdown fences."
         )
         return _request_json_with_raw(
-            retry_system, user, selected_model, think, context, output
+            retry_system, user, selected_model, think, context, output, format_schema
         )
 
 
@@ -122,6 +128,7 @@ def chat_json(
     think: bool | str = False,
     num_ctx: int | None = None,
     num_predict: int | None = None,
+    format_schema: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     return chat_json_with_trace(
         system,
@@ -130,6 +137,7 @@ def chat_json(
         think=think,
         num_ctx=num_ctx,
         num_predict=num_predict,
+        format_schema=format_schema,
     )[0]
 
 
@@ -147,6 +155,9 @@ def embed_texts(texts: List[str], model: str | None = None) -> List[List[float]]
         OLLAMA_TIMEOUT,
     )
     embeddings = body.get("embeddings")
-    if not isinstance(embeddings, list):
-        raise RuntimeError("Ollama embedding response missing embeddings.")
+    if not isinstance(embeddings, list) or len(embeddings) != len(texts):
+        raise RuntimeError(
+            f"Ollama returned {len(embeddings) if isinstance(embeddings, list) else 0} "
+            f"embeddings for {len(texts)} inputs."
+        )
     return [[float(v) for v in row] for row in embeddings]
