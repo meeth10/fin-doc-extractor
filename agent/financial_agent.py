@@ -9,7 +9,7 @@ from extractor.financial_schema import FinancialAnswer
 from .ollama_client import chat_json
 from .retrieval_agent import retrieve
 
-REASONING_MODEL = "deepseek-r1:14b"
+REASONING_MODEL = "deepseek-r1:8b"
 RETRIEVAL_MODEL = "ibm/granite4.2:3b"
 
 SYSTEM_PROMPT = """You are the senior financial reasoning analyst.
