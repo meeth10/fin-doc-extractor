@@ -30,7 +30,6 @@ DEBT_COMPONENT_LABELS = (
     "loans", "debentures", "senior notes", "revolving credit", "credit facilities",
 )
 DEBT_FLOW_LABELS = ("proceeds", "issuance", "repayments", "repayment", "cash flow", "borrowings issued")
-
 YEAR_RE = re.compile(r"(?:FY\s*)?(?:19|20)\d{2}(?:[-/–]\d{2})?", re.I)
 
 
@@ -59,18 +58,17 @@ def _year_token(text: Any) -> Optional[str]:
 
 
 def _period_columns(rows: List[List[Any]]) -> Dict[int, str]:
-    """Map actual numeric column indexes to reporting periods without collapsing blanks."""
-    period_columns: Dict[int, str] = {}
+    periods: Dict[int, str] = {}
     for row in rows[:8]:
         if not isinstance(row, list):
             continue
-        for column_index, cell in enumerate(row):
+        for idx, cell in enumerate(row):
             token = _year_token(cell)
-            if token and column_index > 0:
-                period_columns[column_index] = token
-        if len(period_columns) >= 2:
+            if token and idx > 0:
+                periods[idx] = token
+        if len(periods) >= 2:
             break
-    return period_columns
+    return periods
 
 
 def _scope_from_table(table: Dict[str, Any]) -> str:
@@ -95,9 +93,7 @@ def _metric_for_label(label: str) -> Optional[str]:
             a = _norm(alias)
             if normalized == a or re.search(rf"(?<!\w){re.escape(a)}(?!\w)", normalized):
                 candidates.append((len(a), metric))
-    if not candidates:
-        return None
-    return max(candidates, key=lambda item: item[0])[1]
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def _is_debt_flow(label: str, statement: str) -> bool:
@@ -107,38 +103,34 @@ def _is_debt_flow(label: str, statement: str) -> bool:
 
 def _table_facts(statement: str, table: Dict[str, Any], metadata: Dict[str, Any]) -> List[Dict[str, Any]]:
     rows = table.get("table") or []
+    periods = _period_columns(rows)
     if not rows:
         return []
-    periods = _period_columns(rows)
-    facts: List[Dict[str, Any]] = []
-    context: Optional[str] = None
     scope = _scope_from_table(table)
     unit = _scale_from_metadata(metadata)
-
+    context: Optional[str] = None
+    facts: List[Dict[str, Any]] = []
     for row_index, row in enumerate(rows):
         if not isinstance(row, list) or not row:
             continue
         label = str(row[0] or "").strip()
-        numeric_cells: List[Tuple[int, float]] = []
+        numeric: List[Tuple[int, float]] = []
         for column_index, cell in enumerate(row[1:], start=1):
             value = _number(cell)
             if value is not None:
-                numeric_cells.append((column_index, value))
-        if not numeric_cells:
+                numeric.append((column_index, value))
+        if not numeric:
             if label and len(label) < 100 and not _year_token(label):
                 context = label
             continue
-
         metric = _metric_for_label(label) or "unclassified"
-        is_flow = _is_debt_flow(label, statement)
-        for column_index, value in numeric_cells:
-            period = periods.get(column_index)
+        for column_index, value in numeric:
             fact = {
                 "fact_id": None,
                 "metric": metric,
                 "label": label,
                 "value": value,
-                "period": period,
+                "period": periods.get(column_index),
                 "column_index": column_index,
                 "page": table.get("page_number_human") or table.get("page_number"),
                 "statement": statement,
@@ -151,7 +143,7 @@ def _table_facts(statement: str, table: Dict[str, Any], metadata: Dict[str, Any]
                 "scope": scope,
                 "unit": unit,
                 "row_index": row_index,
-                "is_flow_candidate": is_flow,
+                "is_flow_candidate": _is_debt_flow(label, statement),
                 "status": "reported",
             }
             fact["fact_key"] = _fact_key(fact)
@@ -203,13 +195,15 @@ def _same_fact(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
         same_value = abs(float(a.get("value", 0)) - float(b.get("value", 0))) < 1e-9
     except (TypeError, ValueError):
         same_value = a.get("value") == b.get("value")
+    scopes = {a.get("scope") or "unknown", b.get("scope") or "unknown"}
+    same_scope = len(scopes) == 1 or "unknown" in scopes
     return (
         a.get("metric") == b.get("metric")
         and same_value
         and a.get("period") == b.get("period")
         and a.get("page") == b.get("page")
         and a.get("statement") == b.get("statement")
-        and a.get("scope") == b.get("scope")
+        and same_scope
     )
 
 
@@ -220,16 +214,15 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
         for table in bucket.get("tables", []):
             facts.extend(_table_facts(statement, table, metadata))
 
-    resolver_metrics = (
-        "revenue", "ebit", "pat", "pbt", "depreciation", "finance_costs",
-        "cash_and_equivalents", "cfo", "capex", "total_assets", "total_equity", "market_capitalization",
-    )
-    for metric in resolver_metrics:
+    for metric in (
+        "revenue", "ebit", "pat", "pbt", "depreciation", "finance_costs", "cash_and_equivalents",
+        "cfo", "capex", "total_assets", "total_equity", "market_capitalization",
+    ):
         for candidate in _resolver_facts(metric, data, metadata):
             if not any(_same_fact(candidate, existing) for existing in facts):
                 facts.append(candidate)
 
-    derived: List[Dict[str, Any]] = []
+    derived = []
     for calculation in (compute_ebitda(data), compute_enterprise_value(data)):
         if calculation and calculation.get("status") == "derived":
             derived.append(calculation)
@@ -247,8 +240,7 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
 
     for calculation in derived:
         unique.append({
-            "fact_id": f"d{len(unique)}",
-            "metric": calculation.get("metric"), "label": calculation.get("metric"),
+            "fact_id": f"d{len(unique)}", "metric": calculation.get("metric"), "label": calculation.get("metric"),
             "value": calculation.get("answer"), "period": calculation.get("period"), "column_index": None,
             "page": None, "statement": None, "table_title": None, "source": "calculation_engine",
             "validated": True, "score": 1.0, "statement_confidence": 1.0, "section_context": None,
@@ -259,7 +251,7 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
         })
 
     return {
-        "schema_version": "3.1",
+        "schema_version": "3.2",
         "document": {
             "source_name": data.get("summary", {}).get("source_name"),
             "currency": metadata.get("currency"),
@@ -272,12 +264,9 @@ def build_fact_store(data: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def total_debt_candidates(facts: List[Dict[str, Any]], period: Optional[str] = None, scope: Optional[str] = None) -> List[Dict[str, Any]]:
-    """Return balance-sheet debt components for one period/scope, never cash-flow movements."""
     result: List[Dict[str, Any]] = []
     for fact in facts:
-        if fact.get("statement") != "balance_sheet" or fact.get("status") != "reported":
-            continue
-        if fact.get("is_flow_candidate"):
+        if fact.get("statement") != "balance_sheet" or fact.get("status") != "reported" or fact.get("is_flow_candidate"):
             continue
         if period and fact.get("period") != period:
             continue
