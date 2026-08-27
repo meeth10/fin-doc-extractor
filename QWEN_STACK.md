@@ -30,23 +30,23 @@ Deterministic accounting engine
 
 | Role | Model | Why |
 |---|---|---|
-| Embedding | `qwen3-embedding:0.6b` | Cheap document/fact retrieval; small memory footprint |
-| Planner | `qwen3:4b` | Strong enough for structured intent extraction without wasting RAM |
-| Analyst | `qwen3:8b` | Main financial reasoning model; used selectively with thinking enabled |
-| Verifier | `qwen3:4b` | Independent second pass for period, scope, arithmetic and source checks |
+| Embedding | `qwen3-embedding:0.6b` | Cheap semantic retrieval with low memory use |
+| Planner | `qwen3:4b` | Structured query interpretation without paying 8B/14B cost |
+| Analyst | `qwen3:8b` | Main local reasoning model; thinking enabled for analytical questions |
+| Verifier | `qwen3:4b` | Independent audit of period, scope, arithmetic and source support |
 
-The models are invoked sequentially and `OLLAMA_KEEP_ALIVE=0` is the default, so the application does not intentionally keep all model weights resident. Ollama currently lists Qwen3 4B at about 2.5 GB, Qwen3 8B at about 5.2 GB, and Qwen3 Embedding 0.6B at about 639 MB. citeturn536755search0turn536755search2
+The application invokes these models sequentially. `OLLAMA_KEEP_ALIVE=0` prevents intentionally retaining every model in memory.
 
 ## Reliability rules
 
 1. Source facts outrank model prose.
-2. Period and column identity stay attached to every numeric fact.
+2. Period and column identity remain attached to every numeric fact.
 3. Reported values are never silently replaced by reconstructed values.
-4. Arithmetic is performed in Python, not by the LLM.
-5. The verifier can force one correction pass and then re-audit the corrected answer.
-6. Unsupported answers are returned as provisional rather than dressed up as high-confidence facts.
+4. Arithmetic is performed in Python.
+5. Rejected answers receive one correction pass and then a second verification pass.
+6. Unsupported answers are returned as provisional rather than disguised as high-confidence facts.
 
-Ollama's chat API supports JSON-schema-constrained output via the `format` field, which the planner, analyst and verifier use. citeturn432331view0turn432331view1
+The Ollama client uses JSON-schema-constrained output for planner, analyst and verifier responses when supported by the installed Ollama version.
 
 ## Install
 
