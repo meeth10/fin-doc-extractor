@@ -44,6 +44,7 @@ _METRIC_TERMS = {
     "cash_and_equivalents": ("cash", "cash balance", "cash and cash equivalents"),
     "revenue": ("revenue", "sales", "turnover"),
     "ebitda": ("ebitda",),
+    "adjusted_ebitda": ("adjusted ebitda",),
     "ebit": ("ebit", "operating profit", "operating income"),
     "depreciation": ("depreciation", "amortisation", "amortization"),
     "pat": ("profit after tax", "net profit", "net income", "pat"),
@@ -73,7 +74,8 @@ def _tokens(text: str) -> set[str]:
 def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
     if not a or not b:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
+    length = min(len(a), len(b))
+    dot = sum(a[i] * b[i] for i in range(length))
     na = math.sqrt(sum(x * x for x in a))
     nb = math.sqrt(sum(x * x for x in b))
     return dot / (na * nb) if na and nb else 0.0
@@ -101,19 +103,20 @@ def _heuristic_plan(question: str) -> Dict[str, Any]:
         operation = "sum"
     elif any(x in lowered for x in ("difference between", "minus", "subtract")):
         operation = "difference"
-    elif _simple_value_question(question) is False:
+    elif not _simple_value_question(question):
         operation = "explain"
     years = YEAR_RE.findall(question)
     target_period = years[0] if years else None
     comparison_period = years[1] if len(years) > 1 else None
     scope = "consolidated" if "consolidated" in lowered else ("standalone" if "standalone" in lowered else "unknown")
+    basis = "reported" if operation == "value" else "unknown"
     return {
         "metrics": metrics,
         "operation": operation,
         "target_period": target_period,
         "comparison_period": comparison_period,
         "scope": scope,
-        "basis": "reported" if operation == "value" else "unknown",
+        "basis": basis,
         "needs_narrative": operation == "explain",
         "definition": "user-requested financial metric",
         "confidence": "medium" if metrics else "low",
@@ -151,11 +154,9 @@ def _rank_facts(question: str, facts: List[Dict[str, Any]], plan: Dict[str, Any]
     target_period = plan.get("target_period")
     scope = plan.get("scope")
     scored: List[Tuple[float, Dict[str, Any]]] = []
-
     for fact in facts:
         text = fact_text(fact)
-        fact_tokens = _tokens(text)
-        score = float(len(query_tokens & fact_tokens))
+        score = float(len(query_tokens & _tokens(text)))
         if fact.get("metric") in metrics:
             score += 6.0
         if fact.get("validated"):
@@ -175,14 +176,7 @@ def _rank_facts(question: str, facts: List[Dict[str, Any]], plan: Dict[str, Any]
         if score > 0:
             scored.append((score, fact))
     scored.sort(key=lambda pair: (-pair[0], pair[1].get("page") or 10**9, pair[1].get("row_index") or 10**9))
-    ranked = [fact for _, fact in scored[:limit]]
-
-    # For multi-metric arithmetic, guarantee that every requested metric has candidates.
-    for metric in metrics:
-        if not any(f.get("metric") == metric for f in ranked):
-            extra = [f for f in facts if f.get("metric") == metric]
-            ranked.extend(extra[:4])
-    return ranked[:limit]
+    return [fact for _, fact in scored[:limit]]
 
 
 def _chunk_pages(data: Dict[str, Any], chunk_size: int = 1400, overlap: int = 180) -> List[Dict[str, Any]]:
@@ -250,38 +244,46 @@ def retrieve(question: str, data: Dict[str, Any], *, out_dir: str = "output", pl
 
     store = build_fact_store(data)
     facts = store.get("facts", [])
-    ranked_facts = _rank_facts(question, facts, resolved_plan)
-
-    selected_facts = ranked_facts[:16]
-    query_embedding: List[float] = []
-    semantic_fact_candidates: List[Dict[str, Any]] = []
+    lexical_ranked = _rank_facts(question, facts, resolved_plan)
     warnings: List[str] = []
+    query_embedding: List[float] = []
+    semantic_ranked: List[Dict[str, Any]] = []
     try:
         fact_items = [{**fact, "text": fact_text(fact)} for fact in facts]
         embedded_facts = _embed_cached(fact_items, out_dir, "qwen_fact_embedding_cache.json", "fact_id")
         query_embedding = embed_texts([question], EMBEDDING_MODEL)[0] if embedded_facts else []
         if query_embedding:
             semantic_ranked = sorted(embedded_facts, key=lambda f: _cosine(query_embedding, f.get("embedding", [])), reverse=True)
-            semantic_fact_candidates = [_without_embedding(f) for f in semantic_ranked[:24]]
-            # Hybrid rerank: lexical/structured evidence remains dominant, semantic retrieval fills gaps.
-            by_id = {f.get("fact_id"): f for f in ranked_facts}
-            for fact in semantic_fact_candidates:
-                if fact.get("fact_id") not in by_id:
-                    ranked_facts.append(fact)
-            selected_facts = ranked_facts[:16]
+            semantic_score = {f.get("fact_id"): _cosine(query_embedding, f.get("embedding", [])) for f in embedded_facts}
+            metric_rank = {f.get("fact_id"): i for i, f in enumerate(lexical_ranked)}
+            merged_ids = {f.get("fact_id") for f in lexical_ranked}
+            merged = []
+            for fact in facts:
+                fid = fact.get("fact_id")
+                lexical_bonus = max(0.0, 1.0 - metric_rank.get(fid, 80) / 80.0)
+                semantic_bonus = semantic_score.get(fid, 0.0)
+                structured_bonus = 0.0
+                if fid in merged_ids:
+                    structured_bonus = 0.75
+                total = lexical_bonus + semantic_bonus + structured_bonus
+                if total > 0:
+                    merged.append((total, fact))
+            merged.sort(key=lambda pair: (-pair[0], pair[1].get("page") or 10**9, pair[1].get("row_index") or 10**9))
+            ranked_facts = [fact for _, fact in merged[:40]]
+        else:
+            ranked_facts = lexical_ranked
     except RuntimeError as exc:
         warnings.append(f"Embedding retrieval unavailable; using structured ranking only: {exc}")
+        ranked_facts = lexical_ranked
 
+    selected_facts = ranked_facts[:16]
     selected_chunks: List[Dict[str, Any]] = []
     candidate_chunks: List[Dict[str, Any]] = []
     if resolved_plan.get("needs_narrative") or not selected_facts or resolved_plan.get("operation") == "explain":
         chunks = _chunk_pages(data)
         try:
             embedded_chunks = _embed_cached(chunks, out_dir, "qwen_narrative_embedding_cache.json", "chunk_id")
-            if query_embedding and embedded_chunks:
-                ranked_chunks = sorted(embedded_chunks, key=lambda c: _cosine(query_embedding, c.get("embedding", [])), reverse=True)
-            else:
-                ranked_chunks = embedded_chunks[:8]
+            ranked_chunks = sorted(embedded_chunks, key=lambda c: _cosine(query_embedding, c.get("embedding", [])), reverse=True) if query_embedding else embedded_chunks[:8]
             candidate_chunks = [_without_embedding(c) for c in ranked_chunks[:16]]
             selected_chunks = candidate_chunks[:8]
         except RuntimeError as exc:
@@ -299,7 +301,7 @@ def retrieve(question: str, data: Dict[str, Any], *, out_dir: str = "output", pl
         "selected_facts": selected_facts,
         "selected_chunks": selected_chunks,
         "candidate_facts": ranked_facts[:40],
-        "semantic_fact_candidates": semantic_fact_candidates,
+        "semantic_fact_candidates": [_without_embedding(f) for f in semantic_ranked[:24]],
         "candidate_chunks": candidate_chunks,
         "warnings": warnings,
         "fallback": bool(warnings),
