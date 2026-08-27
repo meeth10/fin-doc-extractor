@@ -27,17 +27,25 @@ def _text_quality(text: str) -> float:
 
 
 def scrape_pdf(pdf_path: str) -> EvidenceDocument:
-    """Extract raw page text and financial-statement tables into neutral evidence."""
-    source = str(Path(pdf_path))
+    """Extract raw page text, statement regions, and tables as neutral evidence."""
+    source = str(Path(pdf_path).expanduser().resolve())
     with fitz.open(source) as doc:
         page_dicts: list[dict[str, Any]] = []
         pages: list[Page] = []
+        page_count = doc.page_count
         for number, page in enumerate(doc, start=1):
             text = page.get_text("text") or ""
             scores = classify_page(text)
             page_dicts.append({"number": number, "statement_scores": scores})
-            pages.append(Page(number, text, "digital", _text_quality(text), scores))
-        page_count = doc.page_count
+            pages.append(
+                Page(
+                    number=number,
+                    text=text,
+                    extraction_method="digital",
+                    text_quality=_text_quality(text),
+                    statement_scores=scores,
+                )
+            )
 
     regions = locate_statements(page_dicts)
     region_pages = [
@@ -49,12 +57,14 @@ def scrape_pdf(pdf_path: str) -> EvidenceDocument:
 
     for table in tables:
         containing = [
-            region for region in regions
+            region
+            for region in regions
             if region.start_page <= table.page <= region.end_page
         ]
         if containing:
             table.statement_type = min(
-                containing, key=lambda region: abs(region.start_page - table.page)
+                containing,
+                key=lambda region: abs(region.start_page - table.page),
             ).statement_type
 
     return EvidenceDocument(
