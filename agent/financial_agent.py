@@ -1,22 +1,28 @@
 from __future__ import annotations
 
+import json
 import re
 from typing import Any, Dict, Optional, Tuple
 
 from extractor.financial_resolver import build_evidence, evidence_sources
 from extractor.financial_schema import FinancialAnswer
 from .ollama_client import chat_json
+from .retrieval_agent import retrieve
 
-SYSTEM_PROMPT = """You are a financial analyst answering questions about one company using supplied evidence.
+REASONING_MODEL = "deepseek-r1:14b"
+
+SYSTEM_PROMPT = """You are the senior financial reasoning analyst.
+You receive a user question plus a retrieval packet selected by a separate retrieval model.
+
 Rules:
-1. Use only the supplied evidence. Never invent a number.
-2. Prefer a directly reported line item over a derived value when it exists.
-3. If the resolver supplies a deterministic calculation under `computed`, you MUST use that result and must not recalculate it differently.
-4. If the requested metric is absent from the evidence, return status=not_available and answer=null.
-5. If the evidence conflicts or the period cannot be identified, return status=ambiguous.
-6. A derived metric must show the formula and its input values.
-7. Preserve the document's currency and unit.
-8. Return JSON only with this shape:
+1. Use only the supplied retrieval packet and deterministic computed evidence.
+2. Never invent a number, period, unit, or source.
+3. Prefer directly reported aggregate line items over components.
+4. If `computed` is present, it is authoritative and must be used exactly.
+5. Distinguish reported from derived values.
+6. For derived metrics, show the formula and the actual input values.
+7. If evidence is insufficient or conflicts, return ambiguous/not_available rather than guessing.
+8. Return JSON only:
 {
   "metric": string,
   "answer": number|string|null,
@@ -63,6 +69,8 @@ def _source_truth(question: str, evidence: Dict[str, Any]) -> Optional[Financial
         return None
     value, period, source = selected
     metadata = evidence.get("document", {}).get("metadata", {}) or {}
+    is_raw = source.get("source") == "raw_text"
+    confidence = "medium" if is_raw else ("high" if source.get("validated") else "medium")
     return FinancialAnswer(
         metric=metric,
         answer=value,
@@ -70,11 +78,11 @@ def _source_truth(question: str, evidence: Dict[str, Any]) -> Optional[Financial
         currency=metadata.get("currency"),
         unit=metadata.get("unit") or metadata.get("currency_unit"),
         status="reported",
-        confidence="high" if source.get("validated") else "medium",
+        confidence=confidence,
         formula=None,
         inputs=[],
-        sources=evidence_sources(evidence.get("candidates", []), evidence.get("raw_evidence", []))[:3],
-        explanation=f"Source-verified under {source.get('table_title') or source.get('matched_alias') or metric}.",
+        sources=evidence_sources([source], []),
+        explanation=f"Source-selected under {source.get('table_title') or source.get('matched_alias') or metric}.",
     )
 
 
@@ -82,11 +90,11 @@ def _validate(payload: Dict[str, Any], evidence: Dict[str, Any]) -> FinancialAns
     required = {"metric", "answer", "period", "currency", "unit", "status", "confidence", "formula", "inputs", "explanation"}
     missing = required - set(payload)
     if missing:
-        raise RuntimeError(f"Ollama response missing fields: {sorted(missing)}")
+        raise RuntimeError(f"DeepSeek response missing fields: {sorted(missing)}")
     if payload["status"] not in {"reported", "derived", "ambiguous", "not_available"}:
-        raise RuntimeError("Ollama returned an invalid financial status.")
+        raise RuntimeError("DeepSeek returned an invalid financial status.")
     if payload["confidence"] not in {"high", "medium", "low"}:
-        raise RuntimeError("Ollama returned an invalid confidence.")
+        raise RuntimeError("DeepSeek returned an invalid confidence.")
     if payload["status"] != "not_available" and payload["answer"] is None:
         raise RuntimeError("Non-available answer cannot have a null value.")
     if payload["status"] == "not_available" and payload["answer"] is not None:
@@ -112,11 +120,7 @@ def _ground_with_computed(answer: FinancialAnswer, evidence: Dict[str, Any]) -> 
         return answer
     metadata = evidence.get("document", {}).get("metadata", {}) or {}
     source = computed.get("source") or {}
-    if "items" in source:
-        source_items = source.get("items") or []
-        source_candidates = source_items
-    else:
-        source_candidates = [source] if source else []
+    source_candidates = source.get("items") or ([source] if source else [])
     return FinancialAnswer(
         metric=computed.get("metric") or answer.metric,
         answer=computed.get("answer"),
@@ -129,6 +133,24 @@ def _ground_with_computed(answer: FinancialAnswer, evidence: Dict[str, Any]) -> 
         inputs=computed.get("inputs") or [],
         sources=evidence_sources(source_candidates, evidence.get("raw_evidence", [])),
         explanation=answer.explanation or "Calculated deterministically from source evidence.",
+    )
+
+
+def _ground_with_source_truth(llm_answer: FinancialAnswer, source_truth: Optional[FinancialAnswer]) -> FinancialAnswer:
+    if source_truth is None:
+        return llm_answer
+    return FinancialAnswer(
+        metric=source_truth.metric,
+        answer=source_truth.answer,
+        period=source_truth.period,
+        currency=source_truth.currency,
+        unit=source_truth.unit,
+        status=source_truth.status,
+        confidence=source_truth.confidence,
+        formula=source_truth.formula,
+        inputs=llm_answer.inputs,
+        sources=source_truth.sources,
+        explanation=llm_answer.explanation or source_truth.explanation,
     )
 
 
@@ -145,38 +167,42 @@ def answer_question(question: str, data: Dict[str, Any]) -> Dict[str, Any]:
             "evidence": evidence,
         }
 
-    source_truth = _source_truth(question, evidence)
+    retrieval_packet = retrieve(question, evidence)
+    reasoning_input = {
+        "question": question,
+        "computed": evidence.get("computed"),
+        "document": evidence.get("document"),
+        "retrieval": retrieval_packet,
+        "evidence_candidates": retrieval_packet.get("selected_sources", []),
+        "retrieval_warnings": retrieval_packet.get("warnings", []),
+    }
     user_prompt = (
-        "Answer the question using ONLY this evidence.\n\n"
-        "If `computed` is present, it is authoritative for the requested arithmetic. "
-        "Use it exactly and explain it briefly.\n\n"
-        f"{evidence}\n\n"
+        "Reason through the financial question using ONLY this packet. "
+        "The retrieval specialist selected the evidence; do not go back to unsupported facts. "
+        "If `computed` is present, it is authoritative.\n\n"
+        f"{json.dumps(reasoning_input, ensure_ascii=False)}\n\n"
         f"Question: {question}"
     )
-    payload = chat_json(SYSTEM_PROMPT, user_prompt)
+    payload = chat_json(
+        SYSTEM_PROMPT,
+        user_prompt,
+        model=REASONING_MODEL,
+        think=True,
+        num_ctx=32768,
+        num_predict=1024,
+    )
     answer = _validate(payload, evidence)
     if evidence.get("computed"):
         answer = _ground_with_computed(answer, evidence)
-    elif source_truth is not None:
-        answer = _ground_with_source_truth(answer, source_truth)
-    return {**answer.as_dict(), "llm_used": True, "llm_model": "qwen3:8b", "evidence": evidence}
-
-
-def _ground_with_source_truth(llm_answer: FinancialAnswer, source_truth: Optional[FinancialAnswer]) -> FinancialAnswer:
-    if source_truth is None:
-        return llm_answer
-    if llm_answer.status in {"reported", "not_available"} or llm_answer.answer != source_truth.answer:
-        return FinancialAnswer(
-            metric=source_truth.metric,
-            answer=source_truth.answer,
-            period=source_truth.period,
-            currency=source_truth.currency,
-            unit=source_truth.unit,
-            status="reported",
-            confidence="high",
-            formula=None,
-            inputs=llm_answer.inputs,
-            sources=source_truth.sources,
-            explanation=llm_answer.explanation or source_truth.explanation,
-        )
-    return llm_answer
+    else:
+        source_truth = _source_truth(question, evidence)
+        if source_truth is not None:
+            answer = _ground_with_source_truth(answer, source_truth)
+    return {
+        **answer.as_dict(),
+        "llm_used": True,
+        "llm_model": REASONING_MODEL,
+        "retrieval_model": "ibm/granite4.2:3b",
+        "retrieval": retrieval_packet,
+        "evidence": evidence,
+    }
